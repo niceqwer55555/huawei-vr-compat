@@ -20,3 +20,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .workbuddy/
+
+# P30 整包固件 5.2GB，仅本地分析用
+update_sd_base/
