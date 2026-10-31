@@ -23,3 +23,6 @@ __pycache__/
 
 # P30 整包固件 5.2GB，仅本地分析用
 update_sd_base/
+
+# 卸载前的原包备份（himovie.vr 116MB 超限），仅本地留存
+backup/apks/
