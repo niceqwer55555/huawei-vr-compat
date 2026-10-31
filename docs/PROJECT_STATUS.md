@@ -238,6 +238,11 @@
   → `<工作区根>/android-sdk` → `<仓库>/android-sdk`
 - PowerShell 7；真机开启无线调试或 USB 调试
 
+> **2026-10 归档复刻环境**（见 PATCH_AUDIT 第 67 节）：本机只有 PowerShell 5.1 与
+> `py`，无 PS7/NDK；JDK 用 JBR25 经 `android-sdk\jdk17tmp\jbr` junction 提供，
+> 编译链不受影响。脚本已适配 5.1 的 BOM/责任 stderr 差异。机器的 DLP 按名
+> 拦截 `adb.exe`，经 `Resolve-HvrAdb` 优先取可运行的改名副本 `adb-tool.exe`。
+
 ### 8.2 构建
 
 ```powershell
@@ -282,7 +287,7 @@ adb logcat | Select-String 'VrSystemActor|VRService_Client|start 3D Launcher|Usi
 | 文档 | 内容 |
 | --- | --- |
 | [PORTING_METHOD.md](PORTING_METHOD.md) | 方法论：只换平台层、四步法、硬性口径 |
-| [PATCH_AUDIT.md](PATCH_AUDIT.md) | 66 节逐轮记录：现象/根因/处理/真机证据 |
+| [PATCH_AUDIT.md](PATCH_AUDIT.md) | 67 节逐轮记录：现象/根因/处理/真机证据 |
 | [HUAWEI_VR_SYSTEM_IFACES.md](HUAWEI_VR_SYSTEM_IFACES.md) | `vr_system` 的 AIDL 契约与各包引用面 |
 | [HELMET_HID_PROTOCOL.md](HELMET_HID_PROTOCOL.md) | `/dev/hwvr1` 的真实协议（标准 HID feature report） |
 | [OFFICIAL_SOURCE_AUDIT.md](OFFICIAL_SOURCE_AUDIT.md) | 手写类 vs 原厂件的逐类对账 |

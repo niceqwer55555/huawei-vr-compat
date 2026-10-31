@@ -152,3 +152,17 @@ install-six.ps1 -Revision r23
 视频/投屏 → 返回空间 → 拔插恢复）全部真机通过后，才会改状态。
 
 异步投屏与头部跟踪本轮只保官方接口，实现留待后续补齐，详见 `docs/PATCH_AUDIT.md`。
+
+---
+
+## AI 交接入口
+
+- **姿态驱动与投屏原理**：[`docs/AI_VR_DRIVER_AND_CASTING.md`](docs/AI_VR_DRIVER_AND_CASTING.md)
+  —— 3DOF/6DOF 的证据链、接口契约、坐标/四元数约定、投屏链路和复刻路线图。
+- **ALVR 无线串流主线**：[`docs/ALVR_HUAWEI_VR_GLASS.md`](docs/ALVR_HUAWEI_VR_GLASS.md)
+  —— 手机当 ALVR 客户端、v0.5.0 发布包、3DoF/6DoF 边界、3DoF Manifest 变体打包与已知坑。
+  `sample-app/` 不是 ALVR 客户端；实际串流应使用 LHT02/HuaweiVRGlass-ALVR。
+- **可运行示例 App**：[`sample-app/README.md`](sample-app/README.md)
+  —— 自动选择 3DOF/6DOF（`TYPE_POSE_6DOF`，无则降级）+ 双目立体渲染 +
+  外接屏 `Presentation` + 平面投屏，包名 `dev.vrdemo.posedriver`。
+  已签名的独立 APK 在 `sample-app/build/posedriver-debug.apk`。

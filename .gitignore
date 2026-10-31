@@ -10,11 +10,13 @@ decode/
 
 build/out/
 build/evidence/
-build/*.apk
+build/**/*.apk
 build/*.png
+lsposed/out/
 
 *.log
 *.idsig
 __pycache__/
 *.pyc
 .DS_Store
+.workbuddy/
