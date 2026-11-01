@@ -24,5 +24,16 @@ __pycache__/
 # P30 整包固件 5.2GB，仅本地分析用
 update_sd_base/
 
-# 卸载前的原包备份（himovie.vr 116MB 超限），仅本地留存
-backup/apks/
+# 卸载前的原包备份与逆向中间件（jar/apk 二进制），仅本地留存
+backup/
+
+# 固件解包产物（系统/base、update_sd_* 若干 GB），仅本地分析用
+系统/
+系统固件/
+
+# 从 APK 里抽出来的 so / dex，属于构建输入缓存，不入库
+build/sdklibs/
+build/appmkt_dex/
+build/vrconn/
+build/cmd_*
+build/*_manifest.txt
