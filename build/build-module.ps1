@@ -1,4 +1,4 @@
-<#
+﻿<#
 Builds one compatibility module from its decoded tree.
 
     decode/<包名>/                      原始反编译树（已由补丁脚本改成目标状态）
@@ -31,8 +31,8 @@ $jdk = (Get-ChildItem (Join-Path $sdk 'jdk17tmp') -Directory | Select-Object -Fi
 $env:JAVA_HOME = $jdk
 $java = Join-Path $jdk 'bin/java.exe'
 $javac = Join-Path $jdk 'bin/javac.exe'
-$bt = Join-Path $sdk 'build-tools/35.0.0'
-$androidJar = Join-Path $sdk 'platforms/android-35/android.jar'
+$bt = Join-Path $sdk 'build-tools/34.0.0'
+$androidJar = Join-Path $sdk 'platforms/android-30/android.jar'
 $apktool = Join-Path $repo 'tools/apktool_2.10.0.jar'
 $framework = Join-Path $repo 'tools/framework'
 $aapt = Join-Path $bt 'aapt2.exe'
@@ -101,8 +101,8 @@ $classFiles = @(Get-ChildItem $compatClasses -Recurse -Filter *.class |
     ForEach-Object { $_.FullName })
 $d8Args = Join-Path $stage 'd8-args.txt'
 @("--lib", $androidJar, "--min-api", "24", "--output", $dexDir) + $classFiles |
-    # UTF-8 无 BOM：仓库路径含中文，ASCII 会破坏路径（d8 按 UTF-8 读 argfile）。
-    Set-Content -LiteralPath $d8Args -Encoding utf8
+    # ASCII 无 BOM：d8 的 argfile 解析器不吃 BOM（?--lib 报错），构建树路径全 ASCII 无虞。
+    Set-Content -LiteralPath $d8Args -Encoding Ascii
 Invoke-Step 'd8 生成 dex' {
     & (Join-Path $bt 'd8.bat') "@$d8Args"
 }

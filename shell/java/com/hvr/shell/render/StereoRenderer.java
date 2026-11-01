@@ -54,24 +54,46 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
                     + "uniform float uK1;\n"
                     + "uniform float uK2;\n"
                     + "uniform float uChroma;\n"
+                    // 每眼旋转：1 = 显示内容顺时针转 90°，2 = 180°，-1 = 逆时针
+                    // 90°（=顺时针 270°），0 = 不转。由 EyeCalibration 持久化配置。
+                    + "uniform float uRotL;\n"
+                    + "uniform float uRotR;\n"
+                    // 左右眼交换：两块面板镜像安装时内容左右反了用它救。
+                    + "uniform float uSwap;\n"
+                    // 每眼独立翻转：两块面板翻装方向可能不同，全局翻转救不了。
+                    + "uniform float uFlipHL;\n"
+                    + "uniform float uFlipHR;\n"
+                    + "uniform float uFlipVL;\n"
+                    + "uniform float uFlipVR;\n"
                     + "void main() {\n"
                     + "    float eye = step(0.5, vUv.x);\n"
                     + "    vec2 local = vec2(vUv.x * 2.0 - eye, vUv.y);\n"
                     + "    vec2 p = local * 2.0 - 1.0;\n"
                     + "    float r2 = dot(p, p);\n"
                     + "    vec2 warped = p * (1.0 + uK1 * r2 + uK2 * r2 * r2);\n"
-                    + "    if (abs(warped.x) > 1.0 || abs(warped.y) > 1.0) {\n"
+                    // 径向畸变与旋转可交换，先算畸变再转采样点等价。
+                    + "    float rot = eye < 0.5 ? uRotL : uRotR;\n"
+                    + "    vec2 src = warped;\n"
+                    + "    if (rot > 1.5) { src = vec2(-warped.x, -warped.y); }\n"
+                    + "    else if (rot > 0.5) { src = vec2(-warped.y, warped.x); }\n"
+                    + "    else if (rot < -0.5) { src = vec2(warped.y, -warped.x); }\n"
+                    + "    float srcEye = uSwap > 0.5 ? 1.0 - eye : eye;\n"
+                    + "    float flipHv = eye < 0.5 ? uFlipHL : uFlipHR;\n"
+                    + "    float flipVv = eye < 0.5 ? uFlipVL : uFlipVR;\n"
+                    + "    if (flipHv > 0.5) { src.x = -src.x; }\n"
+                    + "    if (flipVv > 0.5) { src.y = -src.y; }\n"
+                    + "    if (abs(src.x) > 1.0 || abs(src.y) > 1.0) {\n"
                     + "        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
                     + "        return;\n"
                     + "    }\n"
-                    + "    vec2 uv = vec2((warped.x * 0.5 + 0.5 + eye) * 0.5,\n"
-                    + "                   warped.y * 0.5 + 0.5);\n"
-                    + "    float left = eye * 0.5;\n"
+                    + "    vec2 uv = vec2((src.x * 0.5 + 0.5 + srcEye) * 0.5,\n"
+                    + "                   src.y * 0.5 + 0.5);\n"
+                    + "    float left = srcEye * 0.5;\n"
                     + "    if (uv.x < left || uv.x > left + 0.5) {\n"
                     + "        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
                     + "        return;\n"
                     + "    }\n"
-                    + "    vec2 shift = warped * uChroma;\n"
+                    + "    vec2 shift = src * uChroma;\n"
                     + "    float r = texture2D(uTexture, uv + shift).r;\n"
                     + "    float g = texture2D(uTexture, uv).g;\n"
                     + "    float b = texture2D(uTexture, uv - shift).b;\n"
@@ -107,6 +129,85 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
     private int quadK1;
     private int quadK2;
     private int quadChroma;
+    private int quadRotL;
+    private int quadRotR;
+    private int quadSwap;
+    private int quadFlipHL;
+    private int quadFlipHR;
+    private int quadFlipVL;
+    private int quadFlipVR;
+
+    /** 活跃的双目渲染器注册表：校准按钮一次下发到所有眼镜输出（弱引用防泄漏）。 */
+    private static final java.util.ArrayList<java.lang.ref.WeakReference<StereoRenderer>> LIVE =
+            new java.util.ArrayList<java.lang.ref.WeakReference<StereoRenderer>>();
+
+    /** 每眼显示旋转（1=顺时针90°，2=180°，-1=逆时针90°，0=不转）。默认按镜像安装面板补偿。 */
+    private float eyeRotLeft = 1f;
+    private float eyeRotRight = -1f;
+    private float eyeSwap = 0f;
+    private float eyeFlipHL = 0f;
+    private float eyeFlipHR = 0f;
+    private float eyeFlipVL = 0f;
+    private float eyeFlipVR = 0f;
+
+    /** 用户实测反馈反向时调用：左眼 -1/右眼 +1 或 0 关闭。 */
+    public void setEyeRotation(float left, float right) {
+        eyeRotLeft = left;
+        eyeRotRight = right;
+    }
+
+    /**
+     * 校准入口（EyeCalibration 调用）：steps 0..3 = 顺时针 0/90/180/270°。
+     *
+     * @param swap    true = 左右眼画面交换
+     * @param flipHL  true = 左眼水平镜像
+     * @param flipVL  true = 左眼垂直镜像
+     * @param flipHR  true = 右眼水平镜像
+     * @param flipVR  true = 右眼垂直镜像
+     */
+    public void setEyeRotationSteps(int leftSteps, int rightSteps, boolean swap,
+                                    boolean flipHL, boolean flipVL,
+                                    boolean flipHR, boolean flipVR) {
+        eyeRotLeft = shaderRot(leftSteps);
+        eyeRotRight = shaderRot(rightSteps);
+        eyeSwap = swap ? 1f : 0f;
+        eyeFlipHL = flipHL ? 1f : 0f;
+        eyeFlipVL = flipVL ? 1f : 0f;
+        eyeFlipHR = flipHR ? 1f : 0f;
+        eyeFlipVR = flipVR ? 1f : 0f;
+    }
+
+    private static float shaderRot(int steps) {
+        switch (((steps % 4) + 4) % 4) {
+            case 1:
+                return 1f;
+            case 2:
+                return 2f;
+            case 3:
+                return -1f;
+            default:
+                return 0f;
+        }
+    }
+
+    /** 把一组校准值同时下发到所有活着的双目渲染器（手机端校准按钮的执行路径）。 */
+    public static void applyCalibration(int leftSteps, int rightSteps, boolean swap,
+                                        boolean flipHL, boolean flipVL,
+                                        boolean flipHR, boolean flipVR) {
+        synchronized (LIVE) {
+            java.util.Iterator<java.lang.ref.WeakReference<StereoRenderer>> it = LIVE.iterator();
+            while (it.hasNext()) {
+                StereoRenderer renderer = it.next().get();
+                if (renderer == null) {
+                    it.remove();
+                    continue;
+                }
+                renderer.setEyeRotationSteps(leftSteps, rightSteps, swap,
+                        flipHL, flipVL, flipHR, flipVR);
+            }
+        }
+    }
+
     private FloatBuffer quadBuffer;
 
     private float fovYDegrees = 90f;
@@ -137,6 +238,11 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
         this.lens = lens == null ? LensProfile.NONE : lens;
         this.mode = mode;
         this.scene = scene == null ? new Scene() : scene;
+        if (mode == MODE_STEREO) {
+            synchronized (LIVE) {
+                LIVE.add(new java.lang.ref.WeakReference<StereoRenderer>(this));
+            }
+        }
     }
 
     public void setPredictionMillis(float millis) {
@@ -154,7 +260,7 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
     @Override
     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
         // 与 HomeContent 的面板底色一致（0x0B0D12），接缝与边缘融为一体。
-        GLES20.glClearColor(0.043f, 0.051f, 0.071f, 1f);
+        GLES20.glClearColor(0f, 0f, 0f, 1f); // r18：纯黑背景（用户要求）
         GLES20.glDisable(GLES20.GL_CULL_FACE);
         scene.init();
         buildDistortionPass();
@@ -228,7 +334,7 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
         GLES20.glViewport(0, 0, width, height);
         GLES20.glEnable(GLES20.GL_DEPTH_TEST);
-        GLES20.glClearColor(0.043f, 0.051f, 0.071f, 1f);
+        GLES20.glClearColor(0f, 0f, 0f, 1f); // r18：纯黑背景（用户要求）
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
 
         Matrix.perspectiveM(projection, 0, fovYDegrees,
@@ -245,7 +351,7 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
         GLES20.glDisable(GLES20.GL_BLEND);
         // 必须每帧重设：drawDistortion 会把清屏色改成黑色（GL 全局状态），
         // 不重设的话从第二帧起 FBO 背景就是纯黑（已实机验证的黑屏根因之一）。
-        GLES20.glClearColor(0.043f, 0.051f, 0.071f, 1f);
+        GLES20.glClearColor(0f, 0f, 0f, 1f); // r18：纯黑背景（用户要求）
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
 
         int eyeWidth = Math.max(1, width / 2);
@@ -268,7 +374,7 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
         GLES20.glViewport(0, 0, width, height);
         GLES20.glEnable(GLES20.GL_DEPTH_TEST);
-        GLES20.glClearColor(0.043f, 0.051f, 0.071f, 1f);
+        GLES20.glClearColor(0f, 0f, 0f, 1f); // r18：纯黑背景（用户要求）
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
 
         int eyeWidth = Math.max(1, width / 2);
@@ -289,7 +395,7 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
         GLES20.glViewport(0, 0, width, height);
         GLES20.glDisable(GLES20.GL_DEPTH_TEST);
         GLES20.glDisable(GLES20.GL_BLEND);
-        GLES20.glClearColor(0.043f, 0.051f, 0.071f, 1f);
+        GLES20.glClearColor(0f, 0f, 0f, 1f); // r18：纯黑背景（用户要求）
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
 
         GLES20.glUseProgram(distortProgram);
@@ -299,6 +405,13 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
         GLES20.glUniform1f(quadK1, lens.k1);
         GLES20.glUniform1f(quadK2, lens.k2);
         GLES20.glUniform1f(quadChroma, lens.chroma);
+        GLES20.glUniform1f(quadRotL, eyeRotLeft);
+        GLES20.glUniform1f(quadRotR, eyeRotRight);
+        GLES20.glUniform1f(quadSwap, eyeSwap);
+        GLES20.glUniform1f(quadFlipHL, eyeFlipHL);
+        GLES20.glUniform1f(quadFlipHR, eyeFlipHR);
+        GLES20.glUniform1f(quadFlipVL, eyeFlipVL);
+        GLES20.glUniform1f(quadFlipVR, eyeFlipVR);
 
         GLES20.glEnableVertexAttribArray(quadPosition);
         GLES20.glEnableVertexAttribArray(quadUv);
@@ -352,6 +465,13 @@ public final class StereoRenderer implements GLSurfaceView.Renderer {
         quadK1 = GLES20.glGetUniformLocation(distortProgram, "uK1");
         quadK2 = GLES20.glGetUniformLocation(distortProgram, "uK2");
         quadChroma = GLES20.glGetUniformLocation(distortProgram, "uChroma");
+        quadRotL = GLES20.glGetUniformLocation(distortProgram, "uRotL");
+        quadRotR = GLES20.glGetUniformLocation(distortProgram, "uRotR");
+        quadSwap = GLES20.glGetUniformLocation(distortProgram, "uSwap");
+        quadFlipHL = GLES20.glGetUniformLocation(distortProgram, "uFlipHL");
+        quadFlipHR = GLES20.glGetUniformLocation(distortProgram, "uFlipHR");
+        quadFlipVL = GLES20.glGetUniformLocation(distortProgram, "uFlipVL");
+        quadFlipVR = GLES20.glGetUniformLocation(distortProgram, "uFlipVR");
 
         float[] quad = {
                 -1f, -1f, 0f, 0f,

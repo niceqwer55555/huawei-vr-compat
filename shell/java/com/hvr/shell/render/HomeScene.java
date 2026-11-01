@@ -1,6 +1,7 @@
 package com.hvr.shell.render;
 
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.opengl.GLES20;
 import android.opengl.GLUtils;
 import android.opengl.Matrix;
@@ -19,10 +20,18 @@ import java.nio.FloatBuffer;
  */
 public final class HomeScene implements Renderable {
 
-    /** 面板物理尺寸（米）。2 米处 1.6x0.9 大约占 45° 视场，读小字不累。 */
-    private static final float PANEL_WIDTH = 1.6f;
-    private static final float PANEL_HEIGHT = 0.9f;
-    private static final float PANEL_DISTANCE = 2.0f;
+    /** 面板物理尺寸（米）。r20 拉近到 1.5 米并放大到 1.9 米宽（约 64° 视场）。 */
+    private static final float PANEL_WIDTH = 1.9f;
+    private static final float PANEL_HEIGHT = 1.06875f; // 保持 16:9
+    private static final float PANEL_DISTANCE = 1.5f;
+
+    /** r18：用户要求纯黑背景，星空幕布关闭。 */
+    private static final boolean SHOW_BACKDROP = false;
+
+    /** 背景幕布：远在面板身后的大 quad，铺满视场，转头时有空间纵深。 */
+    private static final float BACKDROP_WIDTH = 14f;
+    private static final float BACKDROP_HEIGHT = 8f;
+    private static final float BACKDROP_DISTANCE = 5.5f;
 
     private static final String VERTEX_SHADER =
             "uniform mat4 uMvp;\n"
@@ -44,6 +53,7 @@ public final class HomeScene implements Renderable {
 
     private final float[] model = new float[16];
     private final float[] mvp = new float[16];
+    private final float[] backdropModel = new float[16];
 
     private int program;
     private int aPosition;
@@ -51,8 +61,11 @@ public final class HomeScene implements Renderable {
     private int uMvp;
     private int uTexture;
     private int texture;
+    private int backdropTexture;
     private FloatBuffer vertexBuffer;
     private FloatBuffer uvBuffer;
+    private FloatBuffer backdropVertexBuffer;
+    private FloatBuffer backdropUvBuffer;
 
     /** 由界面线程写入，GL 线程消费。 */
     private Bitmap pending;
@@ -62,6 +75,9 @@ public final class HomeScene implements Renderable {
         // 面板正对 -Z，中心在眼前 PANEL_DISTANCE 处。
         Matrix.setIdentityM(model, 0);
         Matrix.translateM(model, 0, 0f, 0f, -PANEL_DISTANCE);
+        // 背景幕布：更远、更大，世界锁定。
+        Matrix.setIdentityM(backdropModel, 0);
+        Matrix.translateM(backdropModel, 0, 0f, 0f, -BACKDROP_DISTANCE);
     }
 
     /** 换内容。可以在任意线程调用，真正的上传发生在下一帧。 */
@@ -113,6 +129,89 @@ public final class HomeScene implements Renderable {
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
                 GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+
+        // 背景幕布的顶点与星空纹理。
+        float bHalfW = BACKDROP_WIDTH / 2f;
+        float bHalfH = BACKDROP_HEIGHT / 2f;
+        backdropVertexBuffer = floats(new float[]{
+                -bHalfW, -bHalfH, 0f,
+                bHalfW, -bHalfH, 0f,
+                -bHalfW, bHalfH, 0f,
+                bHalfW, bHalfH, 0f,
+        });
+        backdropUvBuffer = floats(new float[]{
+                0f, 1f,
+                1f, 1f,
+                0f, 0f,
+                1f, 0f,
+        });
+        GLES20.glGenTextures(1, handle, 0);
+        backdropTexture = handle[0];
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, backdropTexture);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0,
+                SHOW_BACKDROP ? makeStarfield() : makeBlackPixel(), 0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+    }
+
+    /** r18：纯黑背景用的 1x1 像素（幕布关闭时替代星空图）。 */
+    private static Bitmap makeBlackPixel() {
+        Bitmap bitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+        bitmap.setPixel(0, 0, android.graphics.Color.BLACK);
+        return bitmap;
+    }
+
+    /** 程序生成的深空星野位图（确定性种子，只生成一次）。 */
+    private static Bitmap makeStarfield() {
+        int width = 2048;
+        int height = 1024;
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        android.graphics.Paint gradient = new android.graphics.Paint();
+        gradient.setShader(new android.graphics.LinearGradient(0, 0, 0, height,
+                android.graphics.Color.rgb(0x08, 0x0D, 0x1E),
+                android.graphics.Color.rgb(0x01, 0x02, 0x06),
+                android.graphics.Shader.TileMode.CLAMP));
+        canvas.drawPaint(gradient);
+        // 地平辉光：底部一点深蓝，像有大气。
+        gradient.setShader(new android.graphics.RadialGradient(
+                width / 2f, height * 1.15f, height * 0.9f,
+                android.graphics.Color.argb(70, 0x14, 0x2C, 0x5A),
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Shader.TileMode.CLAMP));
+        canvas.drawPaint(gradient);
+
+        java.util.Random random = new java.util.Random(20261101L);
+        android.graphics.Paint star = new android.graphics.Paint(
+                android.graphics.Paint.ANTI_ALIAS_FLAG);
+        for (int i = 0; i < 420; i++) {
+            float x = random.nextFloat() * width;
+            float y = random.nextFloat() * height * 0.92f;
+            float size = 1.2f + random.nextFloat() * 3.2f;
+            int alpha = 70 + random.nextInt(160);
+            star.setColor(android.graphics.Color.argb(alpha, 0xDE, 0xE8, 0xFF));
+            canvas.drawCircle(x, y, size, star);
+        }
+        // 十几颗亮星带十字光芒。
+        android.graphics.Paint ray = new android.graphics.Paint(
+                android.graphics.Paint.ANTI_ALIAS_FLAG);
+        ray.setStrokeWidth(2f);
+        for (int i = 0; i < 14; i++) {
+            float x = random.nextFloat() * width;
+            float y = random.nextFloat() * height * 0.8f;
+            float arm = 8f + random.nextFloat() * 14f;
+            ray.setColor(android.graphics.Color.argb(120, 0xE8, 0xF2, 0xFF));
+            canvas.drawLine(x - arm, y, x + arm, y, ray);
+            canvas.drawLine(x, y - arm, x, y + arm, ray);
+        }
+        return bitmap;
     }
 
     @Override
@@ -121,19 +220,29 @@ public final class HomeScene implements Renderable {
             return;
         }
         uploadIfNeeded();
-        Matrix.multiplyMM(mvp, 0, viewProjection, 0, model, 0);
-
         GLES20.glUseProgram(program);
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture);
         GLES20.glUniform1i(uTexture, 0);
-        GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0);
-
         GLES20.glEnableVertexAttribArray(aPosition);
-        GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer);
         GLES20.glEnableVertexAttribArray(aUv);
+
+        // 先画背景幕布（更远，被深度测试自然排在面板后面）。
+        Matrix.multiplyMM(mvp, 0, viewProjection, 0, backdropModel, 0);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, backdropTexture);
+        GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0);
+        GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, 0,
+                backdropVertexBuffer);
+        GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, backdropUvBuffer);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+
+        // 再画桌面面板。
+        Matrix.multiplyMM(mvp, 0, viewProjection, 0, model, 0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture);
+        GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0);
+        GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer);
         GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, uvBuffer);
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+
         GLES20.glDisableVertexAttribArray(aPosition);
         GLES20.glDisableVertexAttribArray(aUv);
     }
@@ -153,6 +262,10 @@ public final class HomeScene implements Renderable {
         }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture);
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0);
+        // r20：纹理是 2880x1620，屏上只占 ~1400px，必须开 mipmap 才不会糊/闪。
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
         bitmap.recycle();
     }
@@ -162,6 +275,10 @@ public final class HomeScene implements Renderable {
         if (texture != 0) {
             GLES20.glDeleteTextures(1, new int[]{texture}, 0);
             texture = 0;
+        }
+        if (backdropTexture != 0) {
+            GLES20.glDeleteTextures(1, new int[]{backdropTexture}, 0);
+            backdropTexture = 0;
         }
         if (program != 0) {
             GLES20.glDeleteProgram(program);

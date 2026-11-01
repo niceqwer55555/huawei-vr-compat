@@ -30,6 +30,8 @@ import android.view.Display;
 public final class ShellService extends Service implements DisplayManager.DisplayListener {
 
     static final String ACTION_RECHECK = "com.hvr.shell.action.RECHECK";
+    /** 远程校准：adb 发 am broadcast 改左右眼旋转/翻转，画面歪了不用找按钮。 */
+    static final String ACTION_CALIB = "com.hvr.shell.action.CALIB";
 
     private static final long POLL_MS = 2000L;
     /**
@@ -45,6 +47,18 @@ public final class ShellService extends Service implements DisplayManager.Displa
     private final Handler handler = new Handler(Looper.getMainLooper());
     private DisplayManager displayManager;
     private boolean displayListenerRegistered;
+    /** 最近一次请求启动桌面的时刻：给系统一点时间把 Activity 搬到眼镜屏，避免先挂 overlay 又拆。 */
+    private long lastLaunchAt;
+    /**
+     * 启动桌面失败次数：EMUI 门禁（vr_system 未注册）拦截时 startActivity 不抛异常、
+     * Activity 也不会起来，若不计数就会陷入「每次轮询重试启动→刷新等待窗口→
+     * overlay 永远挂不上」的死循环。尝试 2 次后放弃 Activity 路线，直接服务直出。
+     */
+    private int launchFailures;
+
+    private final GlassesOverlay overlay = GlassesOverlay.get();
+    /** r21：手机屏悬浮触控板（不依赖 Activity，与手柄可同时用）。 */
+    private final TouchpadOverlay touchpad = new TouchpadOverlay(this);
 
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         @Override
@@ -58,7 +72,11 @@ public final class ShellService extends Service implements DisplayManager.Displa
     private final Runnable poll = new Runnable() {
         @Override
         public void run() {
-            evaluate("poll");
+            try {
+                evaluate("poll");
+            } catch (Throwable error) {
+                ShellState.event("轮询异常（已恢复循环）", error);
+            }
             handler.postDelayed(this, POLL_MS);
         }
     };
@@ -82,16 +100,55 @@ public final class ShellService extends Service implements DisplayManager.Displa
         registerUsbReceiver();
         handler.post(poll);
         handler.post(ensure);
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                touchpad.show(); // r22：服务起来就挂触控板，不等眼镜
+            }
+        }, 800L);
         ShellState.event("VR 服务已启动");
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_RECHECK.equals(intent.getAction())) {
+        String action = intent == null ? null : intent.getAction();
+        if (ACTION_RECHECK.equals(action)) {
             ShellState.event("收到手动检测");
             evaluate("manual");
+        } else if (ACTION_CALIB.equals(action)) {
+            applyCalibration(intent.getStringExtra("op"), intent.getIntExtra("steps", 1));
         }
         return START_STICKY;
+    }
+
+    /** 远程校准入口（adb / 手机按钮共用底层）。op: rotl/rotr/swap/fliph/flipv/reset/空=查状态。 */
+    private void applyCalibration(String op, int steps) {
+        String note;
+        if ("rotl".equals(op)) {
+            note = EyeCalibration.nudge(this, true, steps);
+        } else if ("rotr".equals(op)) {
+            note = EyeCalibration.nudge(this, false, steps);
+        } else if ("swap".equals(op)) {
+            note = EyeCalibration.toggleSwap(this);
+        } else if ("fliph".equals(op)) {
+            note = EyeCalibration.toggleFlipH(this);
+        } else if ("flipv".equals(op)) {
+            note = EyeCalibration.toggleFlipV(this);
+        } else if ("fliphl".equals(op)) {
+            note = EyeCalibration.toggleEyeFlip(this, true, true);
+        } else if ("flipvl".equals(op)) {
+            note = EyeCalibration.toggleEyeFlip(this, true, false);
+        } else if ("fliphr".equals(op)) {
+            note = EyeCalibration.toggleEyeFlip(this, false, true);
+        } else if ("flipvr".equals(op)) {
+            note = EyeCalibration.toggleEyeFlip(this, false, false);
+        } else if ("reset".equals(op)) {
+            note = EyeCalibration.reset(this);
+        } else {
+            note = EyeCalibration.describe(this);
+        }
+        DesktopPresenter.get().publish(this);
+        ShellState.event("远程校准[" + op + "]：" + note);
     }
 
     @Override
@@ -115,26 +172,81 @@ public final class ShellService extends Service implements DisplayManager.Displa
             ShellState.event("注销 USB 监听失败", error);
         }
         ControllerLink.stop();
+        touchpad.hide();
         ShellState.event("VR 服务已停止");
         super.onDestroy();
     }
 
     private void evaluate(String reason) {
+        try {
+            evaluateInner(reason);
+        } catch (Throwable error) {
+            ShellState.event("evaluate(" + reason + ") 异常", error);
+        }
+    }
+
+    private void evaluateInner(String reason) {
         boolean present = GlassPresence.sample(this);
         if (present) {
             if (!"poll".equals(reason)) {
                 ShellState.event("眼镜在位（" + reason + "）：" + GlassPresence.describe());
             }
-            if (!ShellActivity.isForeground()) {
+            // v11/华为栈路线已放弃：不再唤醒任何华为组件（vrservice 已被 EMUI 卸载）。
+            if (ShellActivity.isForeground()) {
+                launchFailures = 0;
+            } else if (launchFailures < 2) {
+                launchFailures++;
                 launchDesktop(reason);
+            } // 已失败 2 次以上：不再尝试启动，让 updateOverlay 直接服务直出
+            try {
+                ControllerLink.start(this);
+            } catch (Throwable error) {
+                ShellState.event("手柄链路启动失败（不影响眼镜输出）", error);
             }
-            ControllerLink.start(this);
+            updateOverlay(reason);
+            touchpad.show();
         } else {
+            overlay.hide();
+            // 触控板常驻：眼镜拔了也能先在手机上操作（用户点「隐藏」才收起）。
             if ("poll".equals(reason)) {
                 return;
             }
             ShellState.event("眼镜不在位（" + reason + "）：" + GlassPresence.describe());
-            ControllerLink.stop();
+            try {
+                ControllerLink.stop();
+            } catch (Throwable error) {
+                ShellState.event("手柄链路停止失败", error);
+            }
+        }
+    }
+
+    /**
+     * 兜底输出：门禁拦 Activity 时直接把桌面窗口挂到眼镜屏。
+     *
+     * <p>顺序策略：</p>
+     * <ol>
+     *   <li>Activity 已被系统放到眼镜屏（vr_only 直出，最理想）→ 什么都不做；</li>
+     *   <li>Activity 自己挂了 Presentation → 什么都不做；</li>
+     *   <li>刚请求过启动（4 秒内）→ 再等等，先不挂；</li>
+     *   <li>否则 → {@link GlassesOverlay} 服务直出，门禁管不到窗口。</li>
+     * </ol>
+     */
+    private void updateOverlay(String reason) {
+        Display glasses = overlay.findGlasses(this);
+        if (glasses == null || ShellActivity.coversGlasses()) {
+            if (overlay.isShowing()) {
+                ShellState.event("眼镜输出交还：" + (glasses == null ? "屏已移除" : "Activity 已接管"));
+            }
+            overlay.hide();
+            return;
+        }
+        long sinceLaunch = System.currentTimeMillis() - lastLaunchAt;
+        if (launchFailures == 0 && sinceLaunch < 4000L) {
+            ShellState.event("等待系统搬移 Activity 到眼镜屏（" + (4000L - sinceLaunch) + "ms 后挂服务直出）");
+            return; // 首次启动尝试后等系统把 Activity 搬到眼镜屏
+        }
+        if (!overlay.isShowing()) {
+            overlay.show(this, glasses, reason);
         }
     }
 
@@ -146,6 +258,7 @@ public final class ShellService extends Service implements DisplayManager.Displa
         intent.putExtra(ShellActivity.EXTRA_TRIGGER, reason);
         try {
             startActivity(intent);
+            lastLaunchAt = System.currentTimeMillis();
             ShellState.environmentNote = "已请求启动 VR 主界面（" + reason + "）";
         } catch (Throwable error) {
             // 后台启动 Activity 被拒：改走全屏意图通知（锁屏/黑屏下也能拉起 Activity），
@@ -218,6 +331,7 @@ public final class ShellService extends Service implements DisplayManager.Displa
 
     @Override
     public void onDisplayRemoved(int displayId) {
+        overlay.onDisplayRemoved(displayId);
         evaluate("displayRemoved:" + displayId);
     }
 

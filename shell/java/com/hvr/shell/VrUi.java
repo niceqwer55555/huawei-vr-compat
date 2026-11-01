@@ -11,16 +11,16 @@ package com.hvr.shell;
  */
 final class VrUi {
 
-    static final int PANEL_WIDTH = 1024;
-    static final int PANEL_HEIGHT = 640;
+    static final int PANEL_WIDTH = 1440;
+    static final int PANEL_HEIGHT = 810;
 
     static final int GRID_COLUMNS = 4;
     static final int GRID_ROWS = 2;
-    static final int TILE_WIDTH = 216;
-    static final int TILE_HEIGHT = 84;
-    static final int TILE_GAP = 12;
-    static final int GRID_LEFT = 48;
-    static final int GRID_TOP = 316;
+    static final int TILE_WIDTH = 300;
+    static final int TILE_HEIGHT = 300;
+    static final int TILE_GAP = 20;
+    static final int GRID_LEFT = 90;
+    static final int GRID_TOP = 160;
 
     /** 8 个格子；已钉的应用按顺序填，剩下的第一格画成「＋」。 */
     static final int SLOTS = GRID_COLUMNS * GRID_ROWS;

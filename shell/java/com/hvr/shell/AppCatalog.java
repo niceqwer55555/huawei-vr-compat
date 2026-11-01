@@ -28,6 +28,36 @@ final class AppCatalog {
     /** 桌面一屏最多放 8 个（4 列 x 2 行），第 9 格永远留给「＋」。 */
     static final int MAX_PINNED = 8;
 
+    /** 首次启动的默认钉选候选：按优先级，存在的才上桌面。 */
+    private static final String[] DEFAULT_CANDIDATES = {
+            "com.huawei.camera",        // 相机
+            "com.android.settings",     // 设置
+            "com.huawei.photos",        // 图库
+            "com.huawei.video",         // 视频
+            "com.huawei.music",         // 音乐
+            "com.huawei.browser",       // 浏览器
+    };
+
+    /** 挑出手机上真实存在的默认应用（有启动入口才算）。 */
+    private static List<Entry> seedDefaults(Context context) {
+        PackageManager pm = context.getPackageManager();
+        List<Entry> result = new ArrayList<>();
+        for (String pkg : DEFAULT_CANDIDATES) {
+            if (result.size() >= 6) {
+                break;
+            }
+            try {
+                CharSequence label = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0));
+                if (pm.getLaunchIntentForPackage(pkg) != null && label != null) {
+                    result.add(new Entry(pkg, label.toString().trim()));
+                }
+            } catch (Throwable ignored) {
+                // 手机上没装，跳过。
+            }
+        }
+        return result;
+    }
+
     static final class Entry {
         final String packageName;
         final String label;
@@ -35,6 +65,40 @@ final class AppCatalog {
         Entry(String packageName, String label) {
             this.packageName = packageName;
             this.label = label;
+        }
+    }
+
+    /** 应用图标缓存：VR 桌面每次重画都要用，真实图标解析开销不小。 */
+    private static final android.util.LruCache<String, android.graphics.Bitmap> ICONS =
+            new android.util.LruCache<String, android.graphics.Bitmap>(32) {
+                @Override
+                protected void entryRemoved(boolean evicted, String key,
+                                            android.graphics.Bitmap old, android.graphics.Bitmap fresh) {
+                    if (old != null && old != fresh) {
+                        old.recycle();
+                    }
+                }
+            };
+
+    /** 取应用图标（方图 sizePx 像素），失败返回 null（调用方画占位）。 */
+    static android.graphics.Bitmap icon(Context context, String packageName, int sizePx) {
+        String key = packageName + "@" + sizePx;
+        android.graphics.Bitmap cached = ICONS.get(key);
+        if (cached != null && !cached.isRecycled()) {
+            return cached;
+        }
+        try {
+            android.graphics.drawable.Drawable drawable = context.getPackageManager()
+                    .getApplicationIcon(packageName);
+            android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(
+                    sizePx, sizePx, android.graphics.Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas canvas = new android.graphics.Canvas(bitmap);
+            drawable.setBounds(0, 0, sizePx, sizePx);
+            drawable.draw(canvas);
+            ICONS.put(key, bitmap);
+            return bitmap;
+        } catch (Throwable error) {
+            return null;
         }
     }
 
@@ -78,6 +142,12 @@ final class AppCatalog {
     /** 当前钉在 VR 桌面上的应用（按用户添加顺序）。 */
     static List<Entry> pinned(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        if (!prefs.contains(KEY_PINNED)) {
+            // 首次使用：seed 一组常见应用（只收真实有启动入口的），避免空桌面。
+            List<Entry> seeded = seedDefaults(context);
+            savePinned(context, seeded);
+            return new ArrayList<>(seeded);
+        }
         String stored = prefs.getString(KEY_PINNED, "");
         List<Entry> result = new ArrayList<>();
         if (stored == null || stored.isEmpty()) {

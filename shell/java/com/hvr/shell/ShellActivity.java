@@ -18,6 +18,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.Display;
+import android.view.InputDevice;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.SurfaceView;
 import android.view.View;
@@ -30,6 +32,7 @@ import android.widget.TextView;
 
 import com.hvr.shell.cast.DisplayFinder;
 import com.hvr.shell.pose.AutoPoseSource;
+import com.hvr.shell.pose.PoseHub;
 import com.hvr.shell.pose.PhoneSensorPoseSource;
 import com.hvr.shell.pose.Pose6DofSensorSource;
 import com.hvr.shell.pose.WalleHidPoseSource;
@@ -60,26 +63,17 @@ public final class ShellActivity extends Activity {
     private static final long FILE_REFRESH_MS = 5000L;
 
     private static volatile boolean foreground;
-
-    /** 当前选中的格子（-1 = 无）。包级可见，供 {@link HomeContent} 画高亮。 */
-    static volatile int selectedSlot = -1;
+    /** 存活实例：供 {@link #coversGlasses()} 从服务侧查询眼镜是否已被 Activity 接管。 */
+    private static volatile ShellActivity instance;
 
     private TextView statusView;
     private GLSurfaceView preview;
     private PadView pad;
 
-    private PhoneSensorPoseSource phoneSource;
-    private WalleHidPoseSource hidSource;
-    private Pose6DofSensorSource sixDofSource;
     private AutoPoseSource activeSource;
 
-    private final HomeScene homeScene = new HomeScene();
+    private final HomeScene homeScene = PoseHub.scene();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-
-    private final List<AppCatalog.Entry> pinnedApps = new ArrayList<>();
-    private float pointerX = VrUi.PANEL_WIDTH / 2f;
-    private float pointerY = VrUi.PANEL_HEIGHT / 2f;
-    private boolean pointerVisible;
 
     private DisplayManagerHolder displayHolder;
     private Presentation presentation;
@@ -108,9 +102,19 @@ public final class ShellActivity extends Activity {
         return foreground;
     }
 
+    /**
+     * 眼镜屏是否已被本 Activity 接管（vr_only 直出全屏，或自己挂了 Presentation）。
+     * 服务侧据此决定要不要用 {@link GlassesOverlay} 兜底，避免双窗口叠加。
+     */
+    static boolean coversGlasses() {
+        ShellActivity live = instance;
+        return live != null && (live.builtForGlasses || live.presentation != null);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        instance = this;
 
         // 锁屏穿透：系统在眼镜插入时会把本 Activity 直接拉到眼镜屏，
         // 原厂 vrservice 流程要等用户解锁（USER_PRESENT → SCREEN_UNLOCK）才放行；
@@ -121,12 +125,11 @@ public final class ShellActivity extends Activity {
         }
 
         displayHolder = new DisplayManagerHolder(this);
-        phoneSource = new PhoneSensorPoseSource(this);
-        hidSource = new WalleHidPoseSource();
-        sixDofSource = new Pose6DofSensorSource(this);
-        activeSource = new AutoPoseSource(sixDofSource, hidSource, phoneSource);
+        // 姿态源与桌面场景全局共享：服务直驱的眼镜输出（GlassesOverlay）与本
+        // Activity 读同一份，手机上滑动、眼镜里实时同步。
+        activeSource = PoseHub.get(this);
 
-        pinnedApps.addAll(AppCatalog.pinned(this));
+        DesktopPresenter.get().ensureLoaded(this);
         buildUi();
         ShellService.ensureRunning(this);
 
@@ -159,9 +162,8 @@ public final class ShellActivity extends Activity {
         } catch (Throwable error) {
             ShellState.event("解除锁屏请求失败", error);
         }
-        activeSource.start();
-        poseStarted = true;
-        if (preview != null) {
+        PoseHub.acquire(this);
+        poseStarted = true;        if (preview != null) {
             preview.onResume();
         }
         displayHolder.register(new Runnable() {
@@ -193,7 +195,7 @@ public final class ShellActivity extends Activity {
             preview.onPause();
         }
         if (poseStarted) {
-            activeSource.stop();
+            PoseHub.release();
             poseStarted = false;
         }
         super.onPause();
@@ -201,6 +203,7 @@ public final class ShellActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        instance = null;
         dismissPresentation();
         super.onDestroy();
     }
@@ -220,8 +223,10 @@ public final class ShellActivity extends Activity {
             panelView.setEGLContextClientVersion(2);
             panelView.setPreserveEGLContextOnPause(true);
             // 先不做畸变：排除 shader 越界导致的全黑，验证渲染链路后再调镜片参数。
-            panelView.setRenderer(new StereoRenderer(activeSource, LensProfile.NONE,
-                    StereoRenderer.MODE_STEREO, homeScene));
+            StereoRenderer stereo = new StereoRenderer(activeSource, LensProfile.NONE,
+                    StereoRenderer.MODE_STEREO, homeScene);
+            stereo.setHeadLock(false); // 世界锁定：桌面固定在空间里
+            panelView.setRenderer(stereo);
             panelView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
             stereoRoot.addView(panelView, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -288,13 +293,92 @@ public final class ShellActivity extends Activity {
                 showProbeDialog();
             }
         }), weight());
-        row2.addView(button("全屏投射", new Runnable() {
+        row2.addView(button("进入VR模式", new Runnable() {
             @Override
             public void run() {
+                // 服务是眼镜屏窗口的宿主：先确保它活着，再由它/Activity 挂上眼镜屏。
+                try {
+                    startForegroundService(new Intent(ShellActivity.this, ShellService.class));
+                } catch (Throwable error) {
+                    ShellState.event("拉起服务失败", error);
+                }
                 showOnGlasses();
             }
         }), weight());
         root.addView(row2, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout row3 = new LinearLayout(this);
+        row3.setOrientation(LinearLayout.HORIZONTAL);
+        row3.setPadding(0, 0, 0, dp(6));
+        row3.addView(button("手柄全局接管", new Runnable() {
+            @Override
+            public void run() {
+                if (HvrInputService.isActive()) {
+                    ShellState.event("手柄全局接管已在运行");
+                    return;
+                }
+                // 用户需要手动开启一次：跳到无障碍设置页，本服务就是列表里的「HVR 手柄全局接管」。
+                try {
+                    startActivity(new Intent(
+                            android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                    ShellState.event("请在无障碍列表开启「HVR 手柄全局接管」");
+                } catch (Throwable error) {
+                    ShellState.event("打开无障碍设置失败", error);
+                }
+            }
+        }), weight());
+        root.addView(row3, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 左右眼校准：戴着眼镜请人帮按（或摘下调完再戴），每按一次立即生效并保存。
+        LinearLayout row4 = new LinearLayout(this);
+        row4.setOrientation(LinearLayout.HORIZONTAL);
+        row4.setPadding(0, 0, 0, dp(6));
+        row4.addView(button("左眼+90°", new Runnable() {
+            @Override
+            public void run() {
+                toastState(EyeCalibration.rotateLeft(ShellActivity.this));
+            }
+        }), weight());
+        row4.addView(button("右眼+90°", new Runnable() {
+            @Override
+            public void run() {
+                toastState(EyeCalibration.rotateRight(ShellActivity.this));
+            }
+        }), weight());
+        row4.addView(button("交换L/R", new Runnable() {
+            @Override
+            public void run() {
+                toastState(EyeCalibration.toggleSwap(ShellActivity.this));
+            }
+        }), weight());
+        root.addView(row4, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 第二行：翻转与重置（镜像安装的面板旋转救不了，用翻转救）。
+        LinearLayout row5 = new LinearLayout(this);
+        row5.setOrientation(LinearLayout.HORIZONTAL);
+        row5.setPadding(0, 0, 0, dp(6));
+        row5.addView(button("上下翻转", new Runnable() {
+            @Override
+            public void run() {
+                toastState(EyeCalibration.toggleFlipV(ShellActivity.this));
+            }
+        }), weight());
+        row5.addView(button("左右翻转", new Runnable() {
+            @Override
+            public void run() {
+                toastState(EyeCalibration.toggleFlipH(ShellActivity.this));
+            }
+        }), weight());
+        row5.addView(button("重置校准", new Runnable() {
+            @Override
+            public void run() {
+                toastState(EyeCalibration.reset(ShellActivity.this));
+            }
+        }), weight());
+        root.addView(row5, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         pad = new PadView(this);
@@ -305,8 +389,10 @@ public final class ShellActivity extends Activity {
         preview = new GLSurfaceView(this);
         preview.setEGLContextClientVersion(2);
         preview.setPreserveEGLContextOnPause(true);
-        preview.setRenderer(new StereoRenderer(activeSource, LensProfile.NONE,
-                StereoRenderer.MODE_MONO, homeScene));
+        StereoRenderer previewRenderer = new StereoRenderer(activeSource, LensProfile.NONE,
+                StereoRenderer.MODE_MONO, homeScene);
+        previewRenderer.setHeadLock(false);
+        preview.setRenderer(previewRenderer);
         preview.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
         LinearLayout.LayoutParams previewParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(110));
@@ -331,6 +417,16 @@ public final class ShellActivity extends Activity {
 
     private LinearLayout.LayoutParams weight() {
         return new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+    }
+
+    /** 校准按钮的统一反馈：Toast 显示当前左右眼状态。 */
+    private void toastState(String state) {
+        ShellState.event("眼校准：" + state);
+        try {
+            android.widget.Toast.makeText(this, state, android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Throwable ignored) {
+            // 非主线程或无窗口 token 时静默；状态已记录
+        }
     }
 
     private int dp(int value) {
@@ -388,7 +484,6 @@ public final class ShellActivity extends Activity {
                 case MotionEvent.ACTION_DOWN:
                     downX = event.getX();
                     downY = event.getY();
-                    pointerVisible = true;
                     movePointer(event.getX(), event.getY());
                     return true;
                 case MotionEvent.ACTION_MOVE:
@@ -403,7 +498,7 @@ public final class ShellActivity extends Activity {
                     }
                     return true;
                 case MotionEvent.ACTION_CANCEL:
-                    pointerVisible = false;
+                    DesktopPresenter.get().setPointer(getContext(), 0f, 0f, false);
                     publishContent();
                     return true;
                 default:
@@ -414,29 +509,67 @@ public final class ShellActivity extends Activity {
         private void movePointer(float x, float y) {
             float normalizedX = getWidth() == 0 ? 0f : (x / getWidth()) * 2f - 1f;
             float normalizedY = getHeight() == 0 ? 0f : (y / getHeight()) * 2f - 1f;
-            pointerX = VrUi.toPanelX(normalizedX);
-            pointerY = VrUi.toPanelY(normalizedY);
-            selectedSlot = VrUi.slotAt(pointerX, pointerY);
+            DesktopPresenter.get().movePointer(getContext(), normalizedX, normalizedY);
             publishContent();
         }
     }
 
-    /** 抬手确认：格子是应用就启动，「＋」就打开选择器。 */
+    /** 抬手确认：格子是应用就启动，「＋」就提示去手机端添加。 */
     private void confirmSelection() {
-        int slot = VrUi.slotAt(pointerX, pointerY);
-        if (slot < 0) {
-            return;
-        }
-        if (slot < pinnedApps.size()) {
-            AppCatalog.Entry entry = pinnedApps.get(slot);
-            boolean launched = AppCatalog.launch(this, entry.packageName);
-            ShellState.environmentNote = launched
-                    ? "已启动 " + entry.label + "（画面在手机屏，可用投屏拉进眼镜）"
-                    : "启动失败：" + entry.label;
-        } else if (slot == pinnedApps.size()) {
-            showAddDialog();
+        String note = DesktopPresenter.get().confirm(this);
+        if (note != null) {
+            android.widget.Toast.makeText(this, note, android.widget.Toast.LENGTH_SHORT).show();
         }
         publishContent();
+    }
+
+    // ---------------------------------------------------------------- 手柄输入
+    //  本 Activity 在前台时，标准蓝牙 HID 手柄（任意安卓兼容游戏手柄）的事件会
+    //  走到这里。摇杆连续控指针，方向键在格子间跳，A/确认键等价抬手。
+    //  华为 CF20 的私有 BLE 协议在 vrhandle 里，这里只覆盖标准 HID 手柄。
+
+    /** 摇杆每 60Hz 事件最多走多少面板像素（满杆时）。 */
+    private static final float STICK_SPEED = 8f;
+    private static final float STICK_DEADZONE = 0.18f;
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (handleGamepadKey(event)) {
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        if ((event.getSource() & InputDevice.SOURCE_CLASS_JOYSTICK) != 0
+                && event.getAction() == MotionEvent.ACTION_MOVE) {
+            float x = event.getAxisValue(MotionEvent.AXIS_X);
+            float y = event.getAxisValue(MotionEvent.AXIS_Y);
+            if (Math.abs(x) > STICK_DEADZONE || Math.abs(y) > STICK_DEADZONE) {
+                DesktopPresenter presenter = DesktopPresenter.get();
+                float px = presenter.pointerX + x * STICK_SPEED;
+                float py = presenter.pointerY + y * STICK_SPEED;
+                presenter.setPointer(this, px, py, true);
+                publishContent();
+            }
+            return true;
+        }
+        return super.dispatchGenericMotionEvent(event);
+    }
+
+    /** 手柄按键统一走 DesktopPresenter.handleKey（含校准模式），与全局接管服务行为一致。 */
+    private boolean handleGamepadKey(KeyEvent event) {
+        if (event.getAction() != KeyEvent.ACTION_DOWN
+                && event.getAction() != KeyEvent.ACTION_UP) {
+            return false;
+        }
+        boolean consumed = DesktopPresenter.get().handleKey(this,
+                event.getAction() == KeyEvent.ACTION_DOWN, event.getKeyCode());
+        if (consumed) {
+            publishContent();
+        }
+        return consumed;
     }
 
     // ---------------------------------------------------------------- 硬件诊断
@@ -500,20 +633,12 @@ public final class ShellActivity extends Activity {
     }
 
     private void removeSelected() {
-        if (selectedSlot < 0 || selectedSlot >= pinnedApps.size()) {
-            ShellState.event("先用触控板选中一个应用，再点移除");
-            return;
-        }
-        AppCatalog.removePinned(this, pinnedApps.get(selectedSlot).packageName);
-        reloadPinned();
+        DesktopPresenter.get().removeSelected(this);
+        publishContent();
     }
 
     private void reloadPinned() {
-        pinnedApps.clear();
-        pinnedApps.addAll(AppCatalog.pinned(this));
-        if (selectedSlot >= pinnedApps.size()) {
-            selectedSlot = -1;
-        }
+        DesktopPresenter.get().reloadPinned(this);
         publishContent();
     }
 
@@ -553,6 +678,11 @@ public final class ShellActivity extends Activity {
     }
 
     private void showOnGlasses() {
+        // 服务级窗口已在眼镜屏上：共享同一份场景，无需重复挂载，否则双窗口互相遮挡
+        if (GlassesOverlay.get().isShowing()) {
+            ShellState.event("眼镜屏由服务直出中，Activity 不重复挂载");
+            return;
+        }
         Display display = DisplayFinder.find(this);
         if (display == null) {
             return;
@@ -563,8 +693,11 @@ public final class ShellActivity extends Activity {
         panelView = new GLSurfaceView(displayContext);
         panelView.setEGLContextClientVersion(2);
         panelView.setPreserveEGLContextOnPause(true);
-        panelView.setRenderer(new StereoRenderer(activeSource, LensProfile.GENERIC_BARREL,
-                StereoRenderer.MODE_STEREO, homeScene));
+        StereoRenderer panelRenderer = new StereoRenderer(activeSource, LensProfile.GENERIC_BARREL,
+                StereoRenderer.MODE_STEREO, homeScene);
+        panelRenderer.setHeadLock(true);
+        EyeCalibration.apply(this, panelRenderer);
+        panelView.setRenderer(panelRenderer);
         panelView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
 
         // 眼镜屏是 FLAG_SECURE 显示器：SurfaceFlinger 只合成 secure 图层，
@@ -659,17 +792,18 @@ public final class ShellActivity extends Activity {
     }
 
     private void publishContent() {
-        homeScene.setContent(HomeContent.render(
-                this, new ArrayList<>(pinnedApps), pointerX, pointerY, pointerVisible));
+        DesktopPresenter presenter = DesktopPresenter.get();
+        presenter.publish(this);
         if (statusView != null) {
             StringBuilder text = new StringBuilder();
             text.append("眼镜：").append(GlassPresence.describe()).append('\n');
             text.append("姿态：").append(activeSource.name())
                     .append(activeSource.isPositionTracked() ? " · 6DOF" : " · 3DOF").append('\n');
-            text.append("手柄：").append(ShellState.controllerNote).append('\n');
+            text.append("手柄：").append(ShellState.controllerNote)
+                    .append(HvrInputService.isActive() ? " · 全局接管中" : " · 全局接管未开启").append('\n');
             text.append("文件：").append(ShellState.fileNote).append('\n');
             text.append("输出：").append(panelView == null ? "未连眼镜" : "已进眼镜")
-                    .append(" · 桌面应用 ").append(pinnedApps.size()).append(" 个");
+                    .append(" · 桌面应用 ").append(presenter.pinnedApps.size()).append(" 个");
             statusView.setText(text);
         }
     }
