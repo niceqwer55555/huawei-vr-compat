@@ -45,16 +45,25 @@ public final class HvrInputService extends AccessibilityService {
 
     /** 已打过程日志的键码：同码只打一次，不刷屏。 */
     private final java.util.Set<Integer> loggedKeys = new java.util.HashSet<>();
+    /** r24：前若干个按键无条件记日志，用来判断「到底有没有收到」而不是「映射丢失」。 */
+    private int arrivalCount;
 
     @Override
     protected boolean onKeyEvent(KeyEvent event) {
         // 眼镜不在位 = 桌面不可见：按键与 VR 无关，全部放行。
-        if (DisplayFinder.find(this) == null) {
+        // r24：DisplayFinder 依赖 DisplayManager 枚举，插拔瞬间可能为空；用服务轮询的
+        // glassPresent 兜底，避免「眼镜在位但过滤全放行」的假死。
+        if (DisplayFinder.find(this) == null && !ShellState.glassPresent) {
             return false;
         }
         int action = event.getAction();
         if (action != KeyEvent.ACTION_DOWN && action != KeyEvent.ACTION_UP) {
             return false;
+        }
+        if (action == KeyEvent.ACTION_DOWN && arrivalCount < 16) {
+            arrivalCount++;
+            ShellState.event("按键到达[" + arrivalCount + "] code=" + event.getKeyCode()
+                    + " source=0x" + Integer.toHexString(event.getSource()));
         }
         // 统一路由（含校准模式与长按检测），与 Activity 手柄路径完全一致。
         boolean consumed = DesktopPresenter.get().handleKey(this,

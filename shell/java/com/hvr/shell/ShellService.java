@@ -14,6 +14,8 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
+import android.os.SystemClock;
 import android.view.Display;
 
 /**
@@ -203,6 +205,33 @@ public final class ShellService extends Service implements DisplayManager.Displa
         }
     }
 
+    private long lastWakeAt;
+
+    /**
+     * 插上眼镜后系统会按 VR 使用场景自动熄掉手机屏，于是手机一片黑、触控板也点不动，
+     * 用户以为「根本没有触控模式」。这里在眼镜在位时检测屏幕状态，熄了就拉起桌面
+     * Activity（它带 setTurnScreenOn(true)），把屏点亮。
+     */
+    private void ensurePhoneAwake(String reason) {
+        try {
+            PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+            if (power == null || power.isInteractive()) {
+                return;
+            }
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastWakeAt < 5000L) {
+                return;
+            }
+            lastWakeAt = now;
+            Intent wake = new Intent(this, ShellActivity.class);
+            wake.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(wake);
+            ShellState.event("手机屏已熄灭（" + reason + "），已请求点亮");
+        } catch (Throwable error) {
+            ShellState.event("点亮手机屏失败", error);
+        }
+    }
+
     private void evaluateInner(String reason) {
         boolean present = GlassPresence.sample(this);
         if (present) {
@@ -223,6 +252,7 @@ public final class ShellService extends Service implements DisplayManager.Displa
             }
             updateOverlay(reason);
             touchpad.show();
+            ensurePhoneAwake(reason);
         } else {
             overlay.hide();
             // 触控板常驻：眼镜拔了也能先在手机上操作（用户点「隐藏」才收起）。

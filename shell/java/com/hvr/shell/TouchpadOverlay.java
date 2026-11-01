@@ -64,8 +64,12 @@ final class TouchpadOverlay {
                     WindowManager.LayoutParams.MATCH_PARENT,
                     dpToPx(268),
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    // r24：KEEP_SCREEN_ON —— 插上眼镜后系统会按 VR 使用场景自动熄屏，
+                    // 手机一黑，触控板跟着失效，用户以为「没有触控模式」。挂着的触控板
+                    // 必须让屏幕保持点亮，触手可及。
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                            | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                     PixelFormat.TRANSLUCENT);
             params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
             params.x = 0;
