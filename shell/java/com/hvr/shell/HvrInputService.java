@@ -67,7 +67,7 @@ public final class HvrInputService extends AccessibilityService {
         }
         // 统一路由（含校准模式与长按检测），与 Activity 手柄路径完全一致。
         boolean consumed = DesktopPresenter.get().handleKey(this,
-                action == KeyEvent.ACTION_DOWN, event.getKeyCode());
+                action == KeyEvent.ACTION_DOWN, translateMediaKey(event.getKeyCode()));
         if (!consumed && action == KeyEvent.ACTION_DOWN
                 && loggedKeys.add(event.getKeyCode())) {
             ShellState.event("手柄新键码 " + event.getKeyCode()
@@ -79,6 +79,31 @@ public final class HvrInputService extends AccessibilityService {
     @Override
     public void onAccessibilityEvent(android.view.accessibility.AccessibilityEvent event) {
         // 不需要窗口事件，只为按键过滤存活。
+    }
+
+    /**
+     * r27：眼镜本体（USB HID，/dev/input/event7）只声明了媒体键：
+     * 0xa3 下一曲 / 0xa4 播放暂停 / 0xa5 上一曲 / 0xa6 停止，外加音量键。
+     * 手柄的 CF20 私有通道（GATT）目前拿不到，但这几个键是现成的输入源，
+     * 映射成桌面导航，至少能「用眼镜上的按键」把指针移起来并确认。
+     */
+    private static int translateMediaKey(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+            case KeyEvent.KEYCODE_MEDIA_STOP:
+            case KeyEvent.KEYCODE_HEADSETHOOK:
+                return KeyEvent.KEYCODE_DPAD_CENTER;
+            case KeyEvent.KEYCODE_MEDIA_NEXT:
+                return KeyEvent.KEYCODE_DPAD_RIGHT;
+            case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+                return KeyEvent.KEYCODE_DPAD_LEFT;
+            case KeyEvent.KEYCODE_VOLUME_UP:
+                return KeyEvent.KEYCODE_DPAD_UP;
+            case KeyEvent.KEYCODE_VOLUME_DOWN:
+                return KeyEvent.KEYCODE_DPAD_DOWN;
+            default:
+                return keyCode;
+        }
     }
 
     @Override

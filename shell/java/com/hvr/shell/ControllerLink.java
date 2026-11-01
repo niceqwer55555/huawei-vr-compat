@@ -14,7 +14,10 @@ import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
@@ -53,6 +56,16 @@ final class ControllerLink {
     /** vrhandle 里的私有 BLE 服务（CF20 数据通道可能也挂在这里，一并订阅）。 */
     private static final UUID CONTROLLER_SERVICE =
             UUID.fromString("233827e4-09cc-45a4-a59b-4d024138cbbe");
+    /**
+     * r27：真正的厂商私有服务。r15~r26 一直把 233827e4 当服务 UUID —— 那其实是
+     * 服务里的一个<b>特征</b>，所以「找不到私有服务」，也就一直漏订了 6DoF 通道。
+     * 服务下有三路可通知特征：ffb4a651（vrhandle 逆向里的数据通道）、efe23fdf、233827e5。
+     */
+    private static final UUID VENDOR_SERVICE =
+            UUID.fromString("622f5b2a-60da-4484-929a-69e3a9140258");
+    /** 厂商数据特征：vrhandle 里 ffb4a651 承载手柄姿态/按键上报。 */
+    private static final UUID VENDOR_DATA =
+            UUID.fromString("ffb4a651-c224-420b-a134-13d3aba313fb");
     private static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     private static final long SCAN_WINDOW_MS = 12000L;
@@ -74,6 +87,10 @@ final class ControllerLink {
     private BluetoothLeScanner scanner;
     private boolean scanning;
     private boolean running;
+    /** r25：本次会话只发起一次绑定，避免反复弹配对把链路搞乱。 */
+    private boolean bondRequested;
+    /** r26：一次连接只订阅一轮（MTU 回调与看门狗可能重复进入）。 */
+    private boolean subscribed;
 
     private BluetoothGatt gatt;
     /** 待订阅的 CCCD 队列（GATT 一次只能挂起一个写操作）。 */
@@ -137,6 +154,7 @@ final class ControllerLink {
             return;
         }
         String saved = prefs.getString(KEY_MAC, null);
+        registerBondReceiver();
         if (saved != null) {
             // 上次连过的地址：先盲连一次（手柄若开机在旁，无需等广播）。
             ShellState.controllerNote = "手柄重连：" + saved;
@@ -154,7 +172,25 @@ final class ControllerLink {
         handler.removeCallbacksAndMessages(null);
         stopScan();
         closeGatt();
+        unregisterBondReceiver();
         ShellState.controllerNote = "眼镜已拔出，停止";
+    }
+
+    private void registerBondReceiver() {
+        try {
+            context.registerReceiver(bondReceiver,
+                    new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED));
+        } catch (Throwable error) {
+            ShellState.event("绑定状态监听注册失败", error);
+        }
+    }
+
+    private void unregisterBondReceiver() {
+        try {
+            context.unregisterReceiver(bondReceiver);
+        } catch (Throwable ignored) {
+            // 未注册或已注销
+        }
     }
 
     private boolean ensureEnabled() {
@@ -304,6 +340,7 @@ final class ControllerLink {
         if (gatt != null) {
             return;
         }
+        ensureBond(device);
         try {
             gatt = device.connectGatt(context, false, gattCallback,
                     BluetoothDevice.TRANSPORT_LE);
@@ -312,6 +349,49 @@ final class ControllerLink {
             gatt = null;
         }
     }
+
+    /**
+     * r25：HID 的 Report/CCCD 都属于「需要加密链路」的特征，未绑定时 ATT 直接回
+     * Insufficient Authentication，CCCD 写永远等不到回调，随后被远端断链
+     * （实测 status=133、0 包）。所以先发起绑定，绑定完成再连。
+     */
+    private void ensureBond(BluetoothDevice device) {
+        try {
+            int state = device.getBondState();
+            ShellState.event("手柄绑定状态=" + state
+                    + "（10=未绑定 11=绑定中 12=已绑定）");
+            if (state == BluetoothDevice.BOND_NONE && !bondRequested) {
+                bondRequested = true;
+                boolean started = device.createBond();
+                ShellState.event("发起绑定：" + (started ? "已请求" : "被系统拒绝"));
+            }
+        } catch (Throwable error) {
+            ShellState.event("绑定请求异常", error);
+        }
+    }
+
+    /** 绑定状态变化：绑上就立刻重连，让 GATT 走加密链路。 */
+    private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context ctx, Intent intent) {
+            BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE,
+                    BluetoothDevice.ERROR);
+            int previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
+                    BluetoothDevice.ERROR);
+            ShellState.event("绑定状态变化 " + previous + " -> " + state
+                    + (device == null ? "" : " " + device.getAddress()));
+            if (state == BluetoothDevice.BOND_BONDED && device != null) {
+                closeGatt();
+                handler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        connectSaved(device.getAddress());
+                    }
+                }, 800L);
+            }
+        }
+    };
 
     private void closeGatt() {
         if (gatt != null) {
@@ -324,6 +404,7 @@ final class ControllerLink {
         }
         cccdQueue.clear();
         cccdStarted = false;
+        subscribed = false;
         protocolPending = false;
         currentCccd = null;
         cccdRetry = 0;
@@ -374,6 +455,31 @@ final class ControllerLink {
                 ShellState.event("服务发现失败 status=" + status);
                 return;
             }
+            // r26：先协商 MTU 再订阅。默认 23 字节连 HID 报告都装不下，
+            // 且部分固件在 MTU 未交换时会静默挂住描述符写。
+            try {
+                if (!g.requestMtu(185)) {
+                    ShellState.event("MTU 协商发起失败，直接订阅");
+                    subscribeHid(g);
+                }
+            } catch (Throwable error) {
+                ShellState.event("MTU 协商异常，直接订阅", error);
+                subscribeHid(g);
+            }
+            watchdog(3000L, new Runnable() {
+                @Override
+                public void run() {
+                    ShellState.event("MTU 协商无回调（超时），继续订阅");
+                    if (gatt != null && !cccdStarted && cccdTotal == 0) {
+                        subscribeHid(gatt);
+                    }
+                }
+            });
+        }
+
+        @Override
+        public void onMtuChanged(BluetoothGatt g, int mtu, int status) {
+            ShellState.event("MTU=" + mtu + " status=" + status);
             subscribeHid(g);
         }
 
@@ -435,6 +541,11 @@ final class ControllerLink {
 
     /** 订阅 HID 服务（与私有服务）下全部可通知特征；协议模式先切 report。 */
     private void subscribeHid(BluetoothGatt g) {
+        // MTU 回调与看门狗兜底可能都走到这里，只能订阅一次。
+        if (subscribed) {
+            return;
+        }
+        subscribed = true;
         cccdQueue.clear();
         protocolPending = false;
         cccdStarted = false;
@@ -445,13 +556,14 @@ final class ControllerLink {
 
         boolean foundHid = false;
         BluetoothGattCharacteristic protocolChar = null;
-        for (BluetoothGattService service : g.getServices()) {
-            UUID uuid = service.getUuid();
-            boolean interesting = HID_SERVICE.equals(uuid) || CONTROLLER_SERVICE.equals(uuid);
-            if (!interesting) {
+        // 先收厂商服务（真正的 6DoF/按键通道），再收 HID 报告：
+        // HID 的 CCCD 会挂死队列，排在后面才不会拖累私有通道。
+        for (UUID wanted : new UUID[]{VENDOR_SERVICE, HID_SERVICE}) {
+            BluetoothGattService service = g.getService(wanted);
+            if (service == null) {
                 continue;
             }
-            if (HID_SERVICE.equals(uuid)) {
+            if (HID_SERVICE.equals(wanted)) {
                 foundHid = true;
                 BluetoothGattCharacteristic protocol = service.getCharacteristic(HID_PROTOCOL_MODE);
                 int props = protocol == null ? 0 : protocol.getProperties();
@@ -476,6 +588,39 @@ final class ControllerLink {
         ShellState.event("HID 服务" + (foundHid ? "已找到" : "未找到（只有私有服务）")
                 + "，待订阅 " + cccdTotal + " 路通知");
         reportCount = 0;
+
+        // r26：先只做「本地注册通知」，不写 CCCD —— 实测第一路描述符写有去无回，
+        // 整条 ATT 队列会被卡死。很多 HID 固件一旦有客户端连接就直接开始推报告，
+        // 先白等 6 秒看有没有数据；真没数据再去写 CCCD。
+        boolean localRegistered = false;
+        for (BluetoothGattService service : g.getServices()) {
+            UUID serviceId = service.getUuid();
+            if (!HID_SERVICE.equals(serviceId) && !VENDOR_SERVICE.equals(serviceId)
+                    && !CONTROLLER_SERVICE.equals(serviceId)) {
+                continue;
+            }
+            for (BluetoothGattCharacteristic characteristic : service.getCharacteristics()) {
+                if ((characteristic.getProperties()
+                        & BluetoothGattCharacteristic.PROPERTY_NOTIFY) == 0) {
+                    continue;
+                }
+                if (g.setCharacteristicNotification(characteristic, true)) {
+                    localRegistered = true;
+                }
+            }
+        }
+        ShellState.event("本地通知注册=" + localRegistered + "，等 6s 看是否自发上报");
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (reportCount > 0) {
+                    ShellState.event("手柄已自发上报 " + reportCount + " 包，跳过 CCCD");
+                    return;
+                }
+                ShellState.event("6s 内无自发上报，开始写 CCCD");
+                startCccdQueue();
+            }
+        }, 6000L);
 
         if (protocolChar != null && WRITE_PROTOCOL_MODE) {
             // r17：协议模式写与 CCCD 写必须串行（GATT 同时只允许一个挂起操作，并发会静默丢弃）。
