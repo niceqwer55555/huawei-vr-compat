@@ -36,6 +36,11 @@ final class TouchpadOverlay {
     private LinearLayout root;
     private TouchpadView pad;
     private boolean showing;
+    /**
+     * r23：{@link ShellActivity} 在前台时让位。Activity 自己带触控板和校准按钮，
+     * 悬浮层压在上面会把整块 UI 的点击全吃掉 —— 表现就是「点了手机按钮没反应」。
+     */
+    private static boolean suppressed;
 
     TouchpadOverlay(Context context) {
         this.context = context;
@@ -46,7 +51,7 @@ final class TouchpadOverlay {
     }
 
     void show() {
-        if (showing) {
+        if (showing || suppressed) {
             return;
         }
         try {
@@ -86,6 +91,16 @@ final class TouchpadOverlay {
         root = null;
         pad = null;
         showing = false;
+    }
+
+    /** Activity 在前台时收掉悬浮层（避免挡住界面点击），退到后台再挂回来。 */
+    void setSuppressed(boolean value) {
+        suppressed = value;
+        if (value) {
+            hide();
+        } else {
+            show();
+        }
     }
 
     // ------------------------------------------------------------------ UI

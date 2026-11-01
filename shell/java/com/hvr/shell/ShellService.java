@@ -60,6 +60,22 @@ public final class ShellService extends Service implements DisplayManager.Displa
     /** r21：手机屏悬浮触控板（不依赖 Activity，与手柄可同时用）。 */
     private final TouchpadOverlay touchpad = new TouchpadOverlay(this);
 
+    private static ShellService instance;
+
+    /**
+     * r23：桌面 Activity 在前台时收掉悬浮触控板。
+     *
+     * <p>两者都在手机屏上：Activity 自带触控板和校准按钮，悬浮层压在上面会把点击全吃掉，
+     * 用户看到的就是「点按钮没反应」。Activity 起来就收起，退到后台（眼镜里还在显示）
+     * 再挂回来，这样两种控制方式都可用且不打架。</p>
+     */
+    static void setTouchpadSuppressed(boolean suppressed) {
+        ShellService service = instance;
+        if (service != null) {
+            service.touchpad.setSuppressed(suppressed);
+        }
+    }
+
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -94,6 +110,7 @@ public final class ShellService extends Service implements DisplayManager.Displa
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         ShellState.serviceStartedAt = System.currentTimeMillis();
         startForeground(NOTIFICATION_ID, buildNotification());
         registerDisplayListener();
@@ -173,6 +190,7 @@ public final class ShellService extends Service implements DisplayManager.Displa
         }
         ControllerLink.stop();
         touchpad.hide();
+        instance = null;
         ShellState.event("VR 服务已停止");
         super.onDestroy();
     }

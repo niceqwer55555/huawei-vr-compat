@@ -151,6 +151,8 @@ public final class ShellActivity extends Activity {
     protected void onResume() {
         super.onResume();
         foreground = true;
+        // r23：本界面自带触控板，收起服务里的悬浮层，否则下半屏点击全被它吃掉。
+        ShellService.setTouchpadSuppressed(true);
         // 滑动锁（无 PIN）直接自动解除——用户不用再上滑；有 PIN 时弹出解锁界面。
         try {
             android.app.KeyguardManager keyguard =
@@ -185,6 +187,8 @@ public final class ShellActivity extends Activity {
     @Override
     protected void onPause() {
         foreground = false;
+        // r23：退到后台后眼镜里还在显示，把悬浮触控板挂回来，手机仍能控制。
+        ShellService.setTouchpadSuppressed(false);
         mainHandler.removeCallbacks(contentTick);
         mainHandler.removeCallbacks(fileTick);
         displayHolder.unregister();
