@@ -11,71 +11,60 @@ import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
-import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.KeyEvent;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 
 /**
- * 手柄（CF20）的自动扫描与 <b>自有 GATT 直连</b>。
+ * 华为 CF20 手柄链路（r29 按实机协议重写）。
  *
- * <p><b>演进：</b>r10~r14 走「扫描 → 通知 vrhandle 直连」，被 vrhandle 的设备库
- * 卡死——它的重连只认自己库里 activeState=1 的设备，而激活记录的写盘依赖华为
- * iconnect/vrservice 全家桶（配对界面显示成功但没落盘，进程重启后库仍为空）。
- * 复活那条链 = 重新依赖华为栈，用户已裁决放弃。</p>
+ * <p>协议依据 vrremote 项目的实测记录：
+ * <ul>
+ *   <li>厂商服务 {@code 622f5b2a-…}，真正的输入通道只有 {@code ffb4a651-…} 一路，
+ *       订它就是约 100 包/秒的持续上报；同服务下 233827e5 一包数据都没有。</li>
+ *   <li>HID 服务那三路 0x2A4D 的 CCCD 写在这个固件上会把 ATT 队列挂死
+ *       （r17~r28 全都卡在这里），所以一律不碰。</li>
+ *   <li>手柄不做系统配对（createBond 必然 auth_failure），特征也不要求加密，
+ *       因此不请求绑定、不请求更大 MTU。</li>
+ * </ul>
  *
- * <p><b>r15 起自力更生：CF20 是标准 HID-over-GATT 设备</b>（免配对，vrhandle
- * smali 佐证只有一条 connectGatt 直连路径），本应用自己 connectGatt、订阅
- * HID report 通知（0x1812），收到的原始报告先全量打日志（键位映射下一版
- * 按日志定），后续直接驱动 {@link DesktopPresenter}。</p>
- *
- * <p>扫描前置（缺一则回调静默无结果，r10 实测）：ACCESS_FINE_LOCATION 已授权
- * + 系统定位开关打开 + 蓝牙开。</p>
+ * <p>报文固定 20 字节：按键位、四元数、六轴、触控板绝对坐标、电量。
  */
 final class ControllerLink {
 
-    /** HID-over-GATT 服务。 */
-    private static final UUID HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb");
-    private static final UUID HID_PROTOCOL_MODE =
-            UUID.fromString("00002a4e-0000-1000-8000-00805f9b34fb");
-    private static final UUID HID_REPORT =
-            UUID.fromString("00002a4d-0000-1000-8000-00805f9b34fb");
-    /** HID Report Map（描述符）：报告里每个字节/位用在哪。 */
-    private static final UUID HID_REPORT_DESCRIPTOR =
-            UUID.fromString("00002a4b-0000-1000-8000-00805f9b34fb");
-    /** vrhandle 里的私有 BLE 服务（CF20 数据通道可能也挂在这里，一并订阅）。 */
-    private static final UUID CONTROLLER_SERVICE =
-            UUID.fromString("233827e4-09cc-45a4-a59b-4d024138cbbe");
-    /**
-     * r27：真正的厂商私有服务。r15~r26 一直把 233827e4 当服务 UUID —— 那其实是
-     * 服务里的一个<b>特征</b>，所以「找不到私有服务」，也就一直漏订了 6DoF 通道。
-     * 服务下有三路可通知特征：ffb4a651（vrhandle 逆向里的数据通道）、efe23fdf、233827e5。
-     */
     private static final UUID VENDOR_SERVICE =
             UUID.fromString("622f5b2a-60da-4484-929a-69e3a9140258");
-    /** 厂商数据特征：vrhandle 里 ffb4a651 承载手柄姿态/按键上报。 */
-    private static final UUID VENDOR_DATA =
+    /** 唯一输入通道：订阅后约 100 包/秒。 */
+    private static final UUID INPUT_CHANNEL =
             UUID.fromString("ffb4a651-c224-420b-a134-13d3aba313fb");
     private static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
-    private static final long SCAN_WINDOW_MS = 12000L;
-    private static final long SCAN_RETRY_MS = 20000L;
-    private static final long RECONNECT_MS = 4000L;
-    /** r19：默认不写 0x2A4E（会卡死 EMUI GATT 队列，见 begin 里的注释）。 */
-    private static final boolean WRITE_PROTOCOL_MODE = false;
-
     private static final String PREFS = "controller";
     private static final String KEY_MAC = "controller_mac";
+
+    private static final String NAME_PREFIX = "HUAWEI CF20";
+    private static final int FRAME_SIZE = 20;
+
+    /* 报文 byte0 低 6 位的按键（高两位 0xC0 是帧标记，判断前要掩掉）。 */
+    private static final int BTN_TRIGGER = 0x01;
+    private static final int BTN_CONFIRM = 0x02;
+    private static final int BTN_VOL_DOWN = 0x04;
+    private static final int BTN_VOL_UP = 0x08;
+    private static final int BTN_HOME = 0x10;
+    private static final int BTN_BACK = 0x20;
+
+    private static final long SCAN_WINDOW_MS = 12_000L;
+    private static final long RECONNECT_MS = 3_000L;
+    /** 每 100 包/秒都重绘整张 HUD 会拖死渲染，指针按位移与时间双重节流。 */
+    private static final float POINTER_STEP_PX = 6f;
+    private static final long POINTER_MIN_INTERVAL_MS = 60L;
 
     private static ControllerLink instance;
 
@@ -87,26 +76,16 @@ final class ControllerLink {
     private BluetoothLeScanner scanner;
     private boolean scanning;
     private boolean running;
-    /** r25：本次会话只发起一次绑定，避免反复弹配对把链路搞乱。 */
-    private boolean bondRequested;
-    /** r26：一次连接只订阅一轮（MTU 回调与看门狗可能重复进入）。 */
-    private boolean subscribed;
 
     private BluetoothGatt gatt;
-    /** 待订阅的 CCCD 队列（GATT 一次只能挂起一个写操作）。 */
-    private final java.util.ArrayDeque<BluetoothGattDescriptor> cccdQueue =
-            new java.util.ArrayDeque<>();
-    private int reportCount;
-    private long lastReportLogAt;
-    /** r17 诊断：订阅串行化状态机。 */
-    private boolean protocolPending;
-    private boolean cccdStarted;
-    private int cccdTotal;
-    private int cccdDone;
-    private int cccdFailed;
-    private BluetoothGattDescriptor currentCccd;
-    private int cccdRetry;
-    private Runnable pendingTimeout;
+    private boolean subscribed;
+
+    private int frameCount;
+    private int lastMask;
+    private long lastLogAt;
+    private long lastPointerAt;
+    private float lastPx = -1f;
+    private float lastPy = -1f;
 
     private ControllerLink(Context context) {
         this.context = context;
@@ -134,7 +113,7 @@ final class ControllerLink {
         instance.end();
     }
 
-    // ------------------------------------------------------------------ 生命周期
+    // ---------------------------------------------------------------- 生命周期
 
     private void begin() {
         if (running) {
@@ -154,9 +133,7 @@ final class ControllerLink {
             return;
         }
         String saved = prefs.getString(KEY_MAC, null);
-        registerBondReceiver();
         if (saved != null) {
-            // 上次连过的地址：先盲连一次（手柄若开机在旁，无需等广播）。
             ShellState.controllerNote = "手柄重连：" + saved;
             connectSaved(saved);
         }
@@ -172,25 +149,7 @@ final class ControllerLink {
         handler.removeCallbacksAndMessages(null);
         stopScan();
         closeGatt();
-        unregisterBondReceiver();
-        ShellState.controllerNote = "眼镜已拔出，停止";
-    }
-
-    private void registerBondReceiver() {
-        try {
-            context.registerReceiver(bondReceiver,
-                    new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED));
-        } catch (Throwable error) {
-            ShellState.event("绑定状态监听注册失败", error);
-        }
-    }
-
-    private void unregisterBondReceiver() {
-        try {
-            context.unregisterReceiver(bondReceiver);
-        } catch (Throwable ignored) {
-            // 未注册或已注销
-        }
+        ShellState.controllerNote = "手柄已停止";
     }
 
     private boolean ensureEnabled() {
@@ -198,123 +157,136 @@ final class ControllerLink {
             if (adapter.isEnabled()) {
                 return true;
             }
-            boolean enabled = adapter.enable();
-            ShellState.event("请求打开蓝牙 -> " + enabled);
-            if (!enabled) {
-                ShellState.controllerNote = "蓝牙未开，且系统拒绝了自动打开";
-            }
-            return enabled;
+            ShellState.event("蓝牙未开启，正在请求打开");
+            ShellState.controllerNote = "蓝牙未开启";
+            android.content.Intent intent = new android.content.Intent(
+                    BluetoothAdapter.ACTION_REQUEST_ENABLE);
+            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(intent);
         } catch (Throwable error) {
-            ShellState.event("打开蓝牙被拒", error);
-            ShellState.controllerNote = "蓝牙未开：" + error.getClass().getSimpleName();
-            return false;
+            ShellState.event("请求打开蓝牙失败", error);
         }
+        return false;
     }
 
     // ------------------------------------------------------------------ 扫描
 
     private void startScan() {
-        if (scanning || !running || adapter == null) {
+        if (!running || scanning || gatt != null) {
             return;
         }
-        if (gatt != null) {
-            return; // 已连上就不再扫
-        }
-        scanner = adapter.getBluetoothLeScanner();
-        if (scanner == null) {
-            ShellState.controllerNote = "蓝牙扫描不可用（适配器未就绪）";
-            return;
-        }
-        ScanSettings settings = new ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .build();
         try {
-            scanner.startScan(Collections.<ScanFilter>emptyList(), settings, callback);
+            scanner = adapter.getBluetoothLeScanner();
+            if (scanner == null) {
+                ShellState.event("蓝牙扫描器不可用（蓝牙可能还没开）");
+                return;
+            }
+            ScanSettings settings = new ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build();
+            scanner.startScan(null, settings, callback);
             scanning = true;
-            ShellState.controllerNote = "扫描中";
+            ShellState.controllerNote = "正在扫描手柄";
         } catch (Throwable error) {
             ShellState.event("启动扫描失败", error);
-            ShellState.controllerNote = "扫描失败：" + error.getClass().getSimpleName();
         }
     }
 
     private void stopScan() {
-        if (!scanning || scanner == null) {
+        if (!scanning) {
             return;
         }
-        try {
-            scanner.stopScan(callback);
-        } catch (Throwable error) {
-            // 静默
-        }
         scanning = false;
+        try {
+            if (scanner != null) {
+                scanner.stopScan(callback);
+            }
+        } catch (Throwable ignored) {
+            // 蓝牙状态刚变化时 stopScan 会抛，忽略。
+        }
     }
 
     private final Runnable scanTimeout = new Runnable() {
         @Override
         public void run() {
-            if (!running) {
+            if (!running || gatt != null) {
                 return;
             }
             stopScan();
-            if (gatt == null) {
-                ShellState.controllerNote = "本轮没扫到，稍后重试";
-            }
+            ShellState.controllerNote = "未发现手柄，20 秒后重扫";
             handler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    if (running && gatt == null) {
-                        startScan();
-                        handler.postDelayed(scanTimeout, SCAN_WINDOW_MS);
+                    if (!running || gatt != null) {
+                        return;
                     }
+                    if (!ensureEnabled()) {
+                        return;
+                    }
+                    startScan();
+                    handler.postDelayed(scanTimeout, SCAN_WINDOW_MS);
                 }
-            }, SCAN_RETRY_MS);
+            }, 20_000L);
         }
     };
 
     private final ScanCallback callback = new ScanCallback() {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
-            onFound(result == null ? null : result.getDevice());
+            onFound(result);
         }
 
         @Override
         public void onBatchScanResults(List<ScanResult> results) {
-            if (results == null) {
-                return;
-            }
             for (ScanResult result : results) {
-                onFound(result == null ? null : result.getDevice());
+                onFound(result);
             }
         }
 
         @Override
         public void onScanFailed(int errorCode) {
-            ShellState.event("扫描失败 code=" + errorCode);
-            ShellState.controllerNote = "扫描失败 code=" + errorCode;
             scanning = false;
+            ShellState.event("蓝牙扫描失败，错误码 " + errorCode);
         }
     };
 
-    private void onFound(BluetoothDevice device) {
-        if (device == null || !running || gatt != null) {
+    private void onFound(ScanResult result) {
+        if (gatt != null || !running || result == null || result.getDevice() == null) {
             return;
         }
-        String name;
-        try {
-            name = device.getName();
-        } catch (Throwable error) {
-            name = null;
-        }
-        if (name == null || !looksLikeController(name)) {
+        BluetoothDevice device = result.getDevice();
+        if (!looksLikeController(device, result)) {
             return;
         }
-        String address = device.getAddress();
-        prefs.edit().putString(KEY_MAC, address).apply();
+        ShellState.event("发现手柄 " + safeName(device) + " " + device.getAddress());
         stopScan();
-        ShellState.controllerNote = "已找到 " + name + "，GATT 直连中";
-        ShellState.event("扫到手柄 " + address + " " + name + "，自有 GATT 直连");
         connect(device);
+    }
+
+    /** 名称前缀或广播里的厂商服务 UUID，任一命中即认。 */
+    private static boolean looksLikeController(BluetoothDevice device, ScanResult result) {
+        String name = safeName(device);
+        if (name != null && name.startsWith(NAME_PREFIX)) {
+            return true;
+        }
+        try {
+            if (result.getScanRecord() != null
+                    && result.getScanRecord().getServiceUuids() != null) {
+                String uuids = result.getScanRecord().getServiceUuids().toString().toLowerCase();
+                return uuids.contains(VENDOR_SERVICE.toString().toLowerCase());
+            }
+        } catch (Throwable ignored) {
+            // 扫描记录可能为 null
+        }
+        return false;
+    }
+
+    private static String safeName(BluetoothDevice device) {
+        try {
+            return device.getName();
+        } catch (Throwable error) {
+            return null;
+        }
     }
 
     private void connectSaved(String address) {
@@ -322,126 +294,79 @@ final class ControllerLink {
             BluetoothDevice device = adapter.getRemoteDevice(address);
             connect(device);
         } catch (Throwable error) {
-            ShellState.event("盲连失败（等扫描）", error);
+            ShellState.event("按地址重连失败 " + address, error);
+            startScan();
         }
     }
-
-    private static boolean looksLikeController(String name) {
-        String upper = name.toUpperCase();
-        return upper.contains("CF20")
-                || upper.contains("VR GLASS")
-                || upper.contains("VRGLASS")
-                || upper.contains("HUAWEI VR");
-    }
-
-    // ------------------------------------------------------------------ GATT
 
     private void connect(BluetoothDevice device) {
         if (gatt != null) {
             return;
         }
-        ensureBond(device);
         try {
             gatt = device.connectGatt(context, false, gattCallback,
                     BluetoothDevice.TRANSPORT_LE);
+            if (gatt == null) {
+                ShellState.event("connectGatt 返回空");
+                return;
+            }
+            subscribed = false;
+            prefs.edit().putString(KEY_MAC, device.getAddress()).apply();
+            ShellState.controllerNote = "连接手柄中";
         } catch (Throwable error) {
             ShellState.event("connectGatt 失败", error);
             gatt = null;
         }
     }
 
-    /**
-     * r25：HID 的 Report/CCCD 都属于「需要加密链路」的特征，未绑定时 ATT 直接回
-     * Insufficient Authentication，CCCD 写永远等不到回调，随后被远端断链
-     * （实测 status=133、0 包）。所以先发起绑定，绑定完成再连。
-     */
-    private void ensureBond(BluetoothDevice device) {
-        try {
-            int state = device.getBondState();
-            ShellState.event("手柄绑定状态=" + state
-                    + "（10=未绑定 11=绑定中 12=已绑定）");
-            if (state == BluetoothDevice.BOND_NONE && !bondRequested) {
-                bondRequested = true;
-                boolean started = device.createBond();
-                ShellState.event("发起绑定：" + (started ? "已请求" : "被系统拒绝"));
-            }
-        } catch (Throwable error) {
-            ShellState.event("绑定请求异常", error);
-        }
-    }
-
-    /** 绑定状态变化：绑上就立刻重连，让 GATT 走加密链路。 */
-    private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context ctx, Intent intent) {
-            BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-            int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE,
-                    BluetoothDevice.ERROR);
-            int previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
-                    BluetoothDevice.ERROR);
-            ShellState.event("绑定状态变化 " + previous + " -> " + state
-                    + (device == null ? "" : " " + device.getAddress()));
-            if (state == BluetoothDevice.BOND_BONDED && device != null) {
-                closeGatt();
-                handler.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        connectSaved(device.getAddress());
-                    }
-                }, 800L);
-            }
-        }
-    };
-
     private void closeGatt() {
-        if (gatt != null) {
-            try {
-                gatt.close();
-            } catch (Throwable ignored) {
-                // 静默
-            }
-            gatt = null;
-        }
-        cccdQueue.clear();
-        cccdStarted = false;
+        BluetoothGatt open = gatt;
+        gatt = null;
         subscribed = false;
-        protocolPending = false;
-        currentCccd = null;
-        cccdRetry = 0;
-        if (pendingTimeout != null) {
-            handler.removeCallbacks(pendingTimeout);
-            pendingTimeout = null;
+        if (open == null) {
+            return;
         }
-        ShellState.controllerNote = "手柄未连接";
+        try {
+            open.disconnect();
+        } catch (Throwable ignored) {
+            // 已断开
+        }
+        try {
+            open.close();
+        } catch (Throwable ignored) {
+            // 已关闭
+        }
     }
+
+    // ------------------------------------------------------------------- GATT
 
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
         @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                ShellState.controllerNote = "手柄已连接，发现服务中";
-                ShellState.event("GATT 已连接，开始发现服务");
+                ShellState.event("GATT 已连接，发现服务");
+                ShellState.controllerNote = "手柄已连接，发现服务";
                 try {
                     g.discoverServices();
                 } catch (Throwable error) {
                     ShellState.event("discoverServices 失败", error);
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                ShellState.event("GATT 断开 status=" + status + "，已收 " + reportCount + " 包");
+                ShellState.event("GATT 断开 status=" + status + "，本次共 " + frameCount + " 包");
                 closeGatt();
                 if (running) {
                     handler.postDelayed(new Runnable() {
                         @Override
                         public void run() {
-                            if (running && gatt == null) {
-                                String saved = prefs.getString(KEY_MAC, null);
-                                if (saved != null) {
-                                    ShellState.controllerNote = "手柄重连中";
-                                    connectSaved(saved);
-                                } else {
-                                    startScan();
-                                    handler.postDelayed(scanTimeout, SCAN_WINDOW_MS);
-                                }
+                            if (!running || gatt != null) {
+                                return;
+                            }
+                            String saved = prefs.getString(KEY_MAC, null);
+                            if (saved != null) {
+                                ShellState.controllerNote = "手柄重连中";
+                                connectSaved(saved);
+                            } else {
+                                startScan();
                             }
                         }
                     }, RECONNECT_MS);
@@ -455,374 +380,161 @@ final class ControllerLink {
                 ShellState.event("服务发现失败 status=" + status);
                 return;
             }
-            // r26：先协商 MTU 再订阅。默认 23 字节连 HID 报告都装不下，
-            // 且部分固件在 MTU 未交换时会静默挂住描述符写。
+            BluetoothGattService service = g.getService(VENDOR_SERVICE);
+            if (service == null) {
+                ShellState.event("没有厂商服务（手柄可能没进入 VR 模式）");
+                ShellState.controllerNote = "手柄无厂商服务";
+                return;
+            }
+            BluetoothGattCharacteristic input = service.getCharacteristic(INPUT_CHANNEL);
+            if (input == null) {
+                ShellState.event("厂商服务里没有输入通道 ffb4a651");
+                return;
+            }
+            if (!g.setCharacteristicNotification(input, true)) {
+                ShellState.event("开启本地通知失败");
+                return;
+            }
+            BluetoothGattDescriptor cccd = input.getDescriptor(CCCD);
+            if (cccd == null) {
+                ShellState.event("输入通道没有 CCCD 描述符");
+                return;
+            }
             try {
-                if (!g.requestMtu(185)) {
-                    ShellState.event("MTU 协商发起失败，直接订阅");
-                    subscribeHid(g);
+                cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                if (!g.writeDescriptor(cccd)) {
+                    ShellState.event("CCCD 写入被拒（GATT 忙）");
                 }
             } catch (Throwable error) {
-                ShellState.event("MTU 协商异常，直接订阅", error);
-                subscribeHid(g);
+                ShellState.event("CCCD 写入异常", error);
             }
-            watchdog(3000L, new Runnable() {
-                @Override
-                public void run() {
-                    ShellState.event("MTU 协商无回调（超时），继续订阅");
-                    if (gatt != null && !cccdStarted && cccdTotal == 0) {
-                        subscribeHid(gatt);
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void onMtuChanged(BluetoothGatt g, int mtu, int status) {
-            ShellState.event("MTU=" + mtu + " status=" + status);
-            subscribeHid(g);
         }
 
         @Override
         public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor descriptor,
                                       int status) {
-            if (pendingTimeout != null) {
-                handler.removeCallbacks(pendingTimeout);
-            }
-            String target = descriptor == null ? "?" : String.valueOf(descriptor.getCharacteristic().getUuid());
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                cccdDone++;
-                currentCccd = null;
-                cccdRetry = 0;
-                ShellState.event("CCCD 订阅成功 " + cccdDone + "/" + cccdTotal + " -> " + target);
-            } else {
-                retryCccd(descriptor == null ? null
-                        : descriptor.getCharacteristic().getUuid(), "status=" + status);
+            if (descriptor == null || !CCCD.equals(descriptor.getUuid())) {
                 return;
             }
-            writeNextCccd();
-        }
-
-        @Override
-        public void onCharacteristicRead(BluetoothGatt g,
-                                        BluetoothGattCharacteristic characteristic,
-                                        int status) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                ShellState.event("读特征失败 status=" + status
-                        + " " + characteristic.getUuid());
+                ShellState.event("CCCD 订阅失败 status=" + status);
                 return;
             }
-            ShellState.event("特征值 " + shortUuid(characteristic.getUuid())
-                    + " len=" + (characteristic.getValue() == null
-                    ? 0 : characteristic.getValue().length)
-                    + " hex=" + hex(characteristic.getValue()));
-        }
-
-        @Override
-        public void onCharacteristicWrite(BluetoothGatt g,
-                                          BluetoothGattCharacteristic characteristic,
-                                          int status) {
-            if (pendingTimeout != null) {
-                handler.removeCallbacks(pendingTimeout);
-            }
-            if (protocolPending) {
-                protocolPending = false;
-                ShellState.event("协议模式写入回调 status=" + status + "，开始订阅");
-                startCccdQueue();
-            }
+            subscribed = true;
+            frameCount = 0;
+            lastMask = 0;
+            lastPx = -1f;
+            lastPy = -1f;
+            ShellState.event("手柄已就绪，等待上报");
+            ShellState.controllerNote = "手柄已连接";
         }
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt g,
                                             BluetoothGattCharacteristic characteristic) {
-            onReport(characteristic);
+            if (characteristic == null
+                    || !INPUT_CHANNEL.equals(characteristic.getUuid())) {
+                return;
+            }
+            byte[] data = characteristic.getValue();
+            if (data != null) {
+                handleFrame(data);
+            }
         }
     };
 
-    /** 订阅 HID 服务（与私有服务）下全部可通知特征；协议模式先切 report。 */
-    private void subscribeHid(BluetoothGatt g) {
-        // MTU 回调与看门狗兜底可能都走到这里，只能订阅一次。
-        if (subscribed) {
-            return;
-        }
-        subscribed = true;
-        cccdQueue.clear();
-        protocolPending = false;
-        cccdStarted = false;
-        cccdTotal = 0;
-        cccdDone = 0;
-        cccdFailed = 0;
-        dumpServices(g);
+    // ------------------------------------------------------------------- 报文
 
-        boolean foundHid = false;
-        BluetoothGattCharacteristic protocolChar = null;
-        // 先收厂商服务（真正的 6DoF/按键通道），再收 HID 报告：
-        // HID 的 CCCD 会挂死队列，排在后面才不会拖累私有通道。
-        for (UUID wanted : new UUID[]{VENDOR_SERVICE, HID_SERVICE}) {
-            BluetoothGattService service = g.getService(wanted);
-            if (service == null) {
-                continue;
-            }
-            if (HID_SERVICE.equals(wanted)) {
-                foundHid = true;
-                BluetoothGattCharacteristic protocol = service.getCharacteristic(HID_PROTOCOL_MODE);
-                int props = protocol == null ? 0 : protocol.getProperties();
-                if (protocol != null
-                        && (props & (BluetoothGattCharacteristic.PROPERTY_WRITE
-                        | BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0) {
-                    protocolChar = protocol;
-                }
-            }
-            for (BluetoothGattCharacteristic characteristic : service.getCharacteristics()) {
-                if ((characteristic.getProperties()
-                        & BluetoothGattCharacteristic.PROPERTY_NOTIFY) == 0) {
-                    continue;
-                }
-                BluetoothGattDescriptor cccd = characteristic.getDescriptor(CCCD);
-                if (cccd != null) {
-                    cccdQueue.add(cccd);
-                }
-            }
-        }
-        cccdTotal = cccdQueue.size();
-        ShellState.event("HID 服务" + (foundHid ? "已找到" : "未找到（只有私有服务）")
-                + "，待订阅 " + cccdTotal + " 路通知");
-        reportCount = 0;
-
-        // r26：先只做「本地注册通知」，不写 CCCD —— 实测第一路描述符写有去无回，
-        // 整条 ATT 队列会被卡死。很多 HID 固件一旦有客户端连接就直接开始推报告，
-        // 先白等 6 秒看有没有数据；真没数据再去写 CCCD。
-        boolean localRegistered = false;
-        for (BluetoothGattService service : g.getServices()) {
-            UUID serviceId = service.getUuid();
-            if (!HID_SERVICE.equals(serviceId) && !VENDOR_SERVICE.equals(serviceId)
-                    && !CONTROLLER_SERVICE.equals(serviceId)) {
-                continue;
-            }
-            for (BluetoothGattCharacteristic characteristic : service.getCharacteristics()) {
-                if ((characteristic.getProperties()
-                        & BluetoothGattCharacteristic.PROPERTY_NOTIFY) == 0) {
-                    continue;
-                }
-                if (g.setCharacteristicNotification(characteristic, true)) {
-                    localRegistered = true;
-                }
-            }
-        }
-        ShellState.event("本地通知注册=" + localRegistered + "，等 6s 看是否自发上报");
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (reportCount > 0) {
-                    ShellState.event("手柄已自发上报 " + reportCount + " 包，跳过 CCCD");
-                    return;
-                }
-                ShellState.event("6s 内无自发上报，开始写 CCCD");
-                startCccdQueue();
-            }
-        }, 6000L);
-
-        if (protocolChar != null && WRITE_PROTOCOL_MODE) {
-            // r17：协议模式写与 CCCD 写必须串行（GATT 同时只允许一个挂起操作，并发会静默丢弃）。
-            protocolPending = true;
-            boolean noResponse = (protocolChar.getProperties()
-                    & BluetoothGattCharacteristic.PROPERTY_WRITE) == 0;
-            protocolChar.setWriteType(noResponse
-                    ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-            ShellState.event("写 0x2A4E 协议模式 = Report(01)"
-                    + (noResponse ? "（无响应写）" : "（有响应写）"));
-            try {
-                protocolChar.setValue(new byte[]{0x01});
-                if (!g.writeCharacteristic(protocolChar)) {
-                    protocolPending = false;
-                    ShellState.event("协议模式写发起失败，直接订阅");
-                }
-            } catch (Throwable error) {
-                protocolPending = false;
-                ShellState.event("协议模式写入异常", error);
-            }
-            watchdog(3000L, new Runnable() {
-                @Override
-                public void run() {
-                    if (protocolPending) {
-                        protocolPending = false;
-                        ShellState.event("协议模式写无回调（超时），继续订阅");
-                        startCccdQueue();
-                    }
-                }
-            });
-            if (!protocolPending) {
-                startCccdQueue();
-            }
-        } else {
-            // r19：HID 默认就是 Report 协议，这条写可以省。
-            // 且 EMUI 的 bt_stack 对「无响应写」的完成事件不处理
-            // （日志：btif_gattc_upstreams_evt: Unhandled event (8)），
-            // 写下去会把整条 GATT 队列卡死，后续 CCCD 全被拒——r18 实测。
-            ShellState.event("跳过 0x2A4E 协议模式写，直接订阅通知");
-            startCccdQueue();
-        }
-    }
-
-    /** 打印整棵 GATT 树（r17 诊断：确认手柄到底暴露了哪些通道）。 */
-    private void dumpServices(BluetoothGatt g) {
-        StringBuilder sb = new StringBuilder("GATT 树：");
-        for (BluetoothGattService service : g.getServices()) {
-            sb.append("\n  S ").append(service.getUuid());
-            for (BluetoothGattCharacteristic ch : service.getCharacteristics()) {
-                sb.append("\n    C ").append(ch.getUuid())
-                        .append(" props=0x").append(Integer.toHexString(ch.getProperties()));
-            }
-        }
-        ShellState.event(sb.toString());
-    }
-
-    private void startCccdQueue() {
-        if (cccdStarted) {
-            return;
-        }
-        cccdStarted = true;
-        writeNextCccd();
-    }
-
-    private void watchdog(long delayMs, final Runnable action) {
-        if (pendingTimeout != null) {
-            handler.removeCallbacks(pendingTimeout);
-        }
-        pendingTimeout = new Runnable() {
-            @Override
-            public void run() {
-                action.run();
-            }
-        };
-        handler.postDelayed(pendingTimeout, delayMs);
-    }
-
-    private void writeNextCccd() {
-        if (currentCccd == null) {
-            currentCccd = cccdQueue.poll();
-            cccdRetry = 0;
-        }
-        if (currentCccd == null) {
-            if (gatt != null) {
-                ShellState.controllerNote = "手柄已连接";
-                ShellState.event("订阅完成 " + cccdDone + "/" + cccdTotal
-                        + " 路（失败 " + cccdFailed + "），等待手柄数据");
-                readReportDescriptor(gatt);
+    /** 20 字节报文：按键位 + 四元数 + 六轴 + 触控板 + 电量。 */
+    private void handleFrame(byte[] data) {
+        if (data.length != FRAME_SIZE) {
+            if (frameCount == 0) {
+                ShellState.event("报文长度异常 " + data.length + "：" + hex(data));
             }
             return;
         }
-        attemptCccd();
+        frameCount++;
+
+        int mask = data[0] & 0x3F;
+        int touchX = data[15] & 0xFF;
+        int touchY = data[16] & 0xFF;
+        int level = data[17] & 0xFF;
+
+        long now = System.currentTimeMillis();
+        if (frameCount <= 3 || now - lastLogAt >= 2000L) {
+            lastLogAt = now;
+            boolean touched = touchX != 0 || touchY != 0;
+            ShellState.event("手柄帧 #" + frameCount
+                    + " 键=0x" + Integer.toHexString(data[0] & 0xFF)
+                    + " 触控=" + touchX + "," + touchY + (touched ? "" : "（离开）")
+                    + " 电量=" + level + "%"
+                    + (frameCount <= 3 ? " 原始=" + hex(data) : ""));
+            ShellState.controllerNote = "手柄已连接（" + frameCount + " 包，电量 " + level + "%）";
+        }
+
+        // 触控板绝对坐标 → 面板指针（(0,0) 表示手指离开）。
+        if (touchX != 0 || touchY != 0) {
+            movePointer(touchX / 255f, touchY / 255f);
+        }
+
+        if (mask != lastMask) {
+            dispatchButtons(lastMask, mask);
+            lastMask = mask;
+        }
     }
 
-    private void attemptCccd() {
-        final BluetoothGattDescriptor cccd = currentCccd;
-        if (cccd == null || gatt == null) {
+    /** 按键位是「持续状态」，边沿检测后交给桌面统一路由（与触屏/无障碍同一条路）。 */
+    private void dispatchButtons(int previous, int current) {
+        emitKey(previous, current, BTN_TRIGGER, KeyEvent.KEYCODE_BUTTON_A);
+        emitKey(previous, current, BTN_CONFIRM, KeyEvent.KEYCODE_ENTER);
+        emitKey(previous, current, BTN_BACK, KeyEvent.KEYCODE_BACK);
+        emitKey(previous, current, BTN_HOME, KeyEvent.KEYCODE_HOME);
+        // 音量键留给系统，只记录不拦截。
+    }
+
+    private void emitKey(int previous, int current, int bit, int keyCode) {
+        boolean wasDown = (previous & bit) != 0;
+        boolean isDown = (current & bit) != 0;
+        if (wasDown == isDown) {
             return;
         }
-        final UUID target = cccd.getCharacteristic().getUuid();
-        try {
-            gatt.setCharacteristicNotification(cccd.getCharacteristic(), true);
-            cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-            if (!gatt.writeDescriptor(cccd)) {
-                retryCccd(target, "写发起被拒");
-                return;
-            }
-            watchdog(6000L, new Runnable() {
-                @Override
-                public void run() {
-                    retryCccd(target, "无回调超时");
-                }
-            });
-        } catch (Throwable error) {
-            retryCccd(target, "异常 " + error.getClass().getSimpleName());
-        }
+        DesktopPresenter.get().handleKey(context, isDown, keyCode);
     }
 
-    private void retryCccd(UUID target, String why) {
-        if (pendingTimeout != null) {
-            handler.removeCallbacks(pendingTimeout);
-            pendingTimeout = null;
-        }
-        if (cccdRetry < 3) {
-            cccdRetry++;
-            ShellState.event("CCCD " + why + "，" + target + " 第 " + cccdRetry + " 次重试");
-            handler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    attemptCccd();
-                }
-            }, 900L);
-        } else {
-            cccdFailed++;
-            ShellState.event("CCCD 放弃 " + target + "（" + why + "）");
-            currentCccd = null;
-            handler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    writeNextCccd();
-                }
-            }, 300L);
-        }
-    }
-
-    /** r18：读 HID Report Descriptor（0x2A4B）——6DoF 报告的字段布局全在这里。 */
-    private void readReportDescriptor(BluetoothGatt g) {
-        for (BluetoothGattService service : g.getServices()) {
-            if (!HID_SERVICE.equals(service.getUuid())) {
-                continue;
-            }
-            BluetoothGattCharacteristic descriptor =
-                    service.getCharacteristic(HID_REPORT_DESCRIPTOR);
-            if (descriptor == null) {
-                ShellState.event("没有 0x2A4B 报告描述符");
-                return;
-            }
-            try {
-                if (g.readCharacteristic(descriptor)) {
-                    ShellState.event("读 HID Report Descriptor…");
-                }
-            } catch (Throwable error) {
-                ShellState.event("读报告描述符失败", error);
-            }
+    /**
+     * 触控板绝对坐标驱动指针。
+     *
+     * <p>桌面每帧重绘整张 HUD 位图，100Hz 直推会把渲染线程堵死，所以位移和
+     * 时间都做节流。
+     */
+    private void movePointer(float nx, float ny) {
+        long now = System.currentTimeMillis();
+        if (now - lastPointerAt < POINTER_MIN_INTERVAL_MS) {
             return;
         }
-    }
-
-    // ------------------------------------------------------------------ 数据
-
-    /** 收到手柄报告：先全量记日志（键位映射素材），限频防刷屏。 */
-    private void onReport(BluetoothGattCharacteristic characteristic) {
-        reportCount++;
-        byte[] data = characteristic.getValue();
-        ShellState.controllerNote = "手柄已连接（数据 " + reportCount + " 包）";
-        long now = android.os.SystemClock.elapsedRealtime();
-        boolean head = reportCount <= 12; // r17：前 12 包无条件记，便于看清包结构
-        if (head || (now - lastReportLogAt >= 400L && reportCount <= 400)) {
-            lastReportLogAt = now;
-            ShellState.event("手柄报告[" + reportCount + "] uuid="
-                    + shortUuid(characteristic.getUuid())
-                    + " len=" + (data == null ? 0 : data.length)
-                    + " hex=" + hex(data));
+        float px = VrUi.toPanelX(nx * 2f - 1f);
+        float py = VrUi.toPanelY(ny * 2f - 1f);
+        if (lastPx >= 0f
+                && Math.abs(px - lastPx) < POINTER_STEP_PX
+                && Math.abs(py - lastPy) < POINTER_STEP_PX) {
+            return;
         }
-    }
-
-    private static String shortUuid(UUID uuid) {
-        String s = uuid.toString();
-        return s.length() > 8 ? s.substring(0, 8) : s;
+        lastPointerAt = now;
+        lastPx = px;
+        lastPy = py;
+        DesktopPresenter.get().setPointer(context, px, py, true);
     }
 
     private static String hex(byte[] data) {
-        if (data == null || data.length == 0) {
-            return "(空)";
+        if (data == null) {
+            return "null";
         }
         StringBuilder builder = new StringBuilder(data.length * 3);
         for (byte b : data) {
             if (builder.length() > 0) {
                 builder.append(' ');
             }
-            builder.append(String.format("%02X", b));
+            builder.append(String.format("%02X", b & 0xFF));
         }
         return builder.toString();
     }

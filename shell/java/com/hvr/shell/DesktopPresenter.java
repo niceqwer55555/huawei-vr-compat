@@ -236,6 +236,20 @@ final class DesktopPresenter {
                     }
                 }
                 return true;
+            case android.view.KeyEvent.KEYCODE_HOME:
+                // 手柄主页键：校准模式下等于保存退出，否则指针回到第一格。
+                if (down) {
+                    if (calibMode) {
+                        calibMode = false;
+                        ShellState.event("校准已保存，退出校准模式");
+                    } else {
+                        setPointer(app,
+                                VrUi.tileLeft(0) + VrUi.TILE_WIDTH / 2f,
+                                VrUi.tileTop(0) + VrUi.TILE_HEIGHT / 2f, true);
+                    }
+                    publish(app);
+                }
+                return true;
             case android.view.KeyEvent.KEYCODE_DPAD_LEFT:
             case android.view.KeyEvent.KEYCODE_DPAD_RIGHT:
             case android.view.KeyEvent.KEYCODE_DPAD_UP:

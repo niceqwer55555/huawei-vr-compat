@@ -34,6 +34,8 @@ public final class ShellService extends Service implements DisplayManager.Displa
     static final String ACTION_RECHECK = "com.hvr.shell.action.RECHECK";
     /** 远程校准：adb 发 am broadcast 改左右眼旋转/翻转，画面歪了不用找按钮。 */
     static final String ACTION_CALIB = "com.hvr.shell.action.CALIB";
+    /** 远程启动桌面里的应用（与点格子同一条路径，用于验证启动链路）。 */
+    static final String ACTION_LAUNCH = "com.hvr.shell.action.LAUNCH";
 
     private static final long POLL_MS = 2000L;
     /**
@@ -136,6 +138,13 @@ public final class ShellService extends Service implements DisplayManager.Displa
             evaluate("manual");
         } else if (ACTION_CALIB.equals(action)) {
             applyCalibration(intent.getStringExtra("op"), intent.getIntExtra("steps", 1));
+        } else if (ACTION_LAUNCH.equals(action)) {
+            // 与桌面里点格子走同一条 AppCatalog.launch，用来验证启动链路。
+            String pkg = intent.getStringExtra("pkg");
+            if (pkg != null && !pkg.isEmpty()) {
+                boolean launched = AppCatalog.launch(this, pkg);
+                ShellState.event("远程启动 " + pkg + (launched ? " 已发出" : " 失败"));
+            }
         }
         return START_STICKY;
     }

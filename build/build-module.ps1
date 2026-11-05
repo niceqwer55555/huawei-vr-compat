@@ -55,7 +55,10 @@ if (Test-Path -LiteralPath $stageRoot) {
     Get-ChildItem -LiteralPath $stageRoot -Directory |
         Sort-Object LastWriteTime -Descending | Select-Object -Skip 3 |
         ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            # Remove-Item -Recurse 是逐文件走 .NET，遇到几十万个小文件会慢到几分钟
+            # 甚至像卡死（实测删一份 400MB 解码树副本要 7 分钟以上）。rd /s /q 是
+            # 原生命令，同一棵树 2 秒级。删不掉就留着，不影响本次构建。
+            & cmd /c rd /s /q "`"$($_.FullName)`"" 2>&1 | Out-Null
         }
 }
 $buildRoot = Join-Path $repo 'build'
@@ -73,11 +76,38 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
     if ($LASTEXITCODE -ne 0) { throw "$name 失败（exit $LASTEXITCODE）" }
 }
 
+# javac 会把「source 8 已过时」这类提示写到 stderr，而 $ErrorActionPreference='Stop'
+# 下 PowerShell 5.1 会把任何原生命令的 stderr 当成终止错误。所以统一捕获输出，
+# 只用退出码判断成败（真正的编译错误也会一并打印出来）。
+function Invoke-Javac {
+    param(
+        [Parameter(Mandatory = $true)][string]$ClassPath,
+        [Parameter(Mandatory = $true)][string]$OutDir,
+        [Parameter(Mandatory = $true)][string[]]$Sources
+    )
+    # PowerShell 5.1：原生命令往 stderr 写一行就会被当成 ErrorRecord，
+    # 在 Stop 首选项下直接终止脚本。这里临时降到 Continue，把它收进日志。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $log = & $javac -nowarn -Xlint:none -encoding UTF-8 -source 8 -target 8 `
+            -classpath $ClassPath -d $OutDir $Sources 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($code -ne 0) {
+        throw "javac 失败（exit $code）：`n$log"
+    }
+    if ($log.Trim()) { Write-Verbose $log }
+    return $log
+}
+
 # 1) 编译期存根（只用于让 javac 看到隐藏 API）
 $stubSources = @(Get-ChildItem (Join-Path $repo 'shared/stubs') -Recurse -Filter *.java |
     ForEach-Object { $_.FullName })
 Invoke-Step '编译存根' {
-    & $javac -nowarn -encoding UTF-8 -source 8 -target 8 -classpath $androidJar -d $stubClasses $stubSources
+    Invoke-Javac -ClassPath $androidJar -OutDir $stubClasses -Sources $stubSources | Out-Null
 }
 
 # 2) 共享兼容层
@@ -91,7 +121,7 @@ if ($Package -eq 'com.huawei.hvrsdkserverapp' -and (Test-Path -LiteralPath $acto
         ForEach-Object { $_.FullName })
 }
 Invoke-Step '编译兼容层' {
-    & $javac -nowarn -encoding UTF-8 -source 8 -target 8 -classpath "$androidJar;$stubClasses" -d $compatClasses $compatSources
+    Invoke-Javac -ClassPath "$androidJar;$stubClasses" -OutDir $compatClasses -Sources $compatSources | Out-Null
 }
 
 # 3) d8 生成额外 dex

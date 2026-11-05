@@ -57,8 +57,15 @@ public final class VrPlatformCompat {
     public static boolean isVrGlassPresent() {
         Context context = application();
         if (context == null) {
-            Log.w(TAG, "no application context, reporting glass absent");
-            return false;
+            // Third-party processes (e.g. the ALVR client) never see our compat
+            // provider, and hidden-API rules can block the reflection fallback.
+            // The kernel node answers the same question with no context at all:
+            // it exists exactly while the glasses probe is satisfied (on real
+            // hardware Huawei's driver creates it; on this port the hvrglass
+            // module keeps it alive while the glasses are attached).
+            boolean fallback = KERNEL_NODE.exists();
+            Log.w(TAG, "no application context, kernel-node probe: " + fallback);
+            return fallback;
         }
         return isVrGlassPresent(context);
     }
@@ -142,14 +149,49 @@ public final class VrPlatformCompat {
         return display == null ? null : display.getName();
     }
 
+    private static final java.io.File KERNEL_NODE = new java.io.File("/dev/hwvr1");
+
     /**
      * 走兼容层统一的 Context 来源（provider 注入的真实 application context）。
      *
      * 之前这里自己反射 `ActivityThread.currentApplication()`：Runtime 的 targetSdk 是
      * 26 时能用，但这个探测会被桌面等 targetSdk≥28 的进程调用，反射会被 hidden API
      * 拦掉，结果是「拿不到 context → 判定眼镜不在位 → 整条手柄链路被跳过」。
+     *
+     * 两级兜底：先普通反射（targetSdk<28 的进程直接可用），被拦再用 meta-reflection
+     * 绕过（通过 Class.class 这个系统类持有 getDeclaredMethod，hidden API 检查对
+     * 系统发起方豁免）。
      */
     private static Context application() {
-        return com.huawei.android.content.ContextEx.currentApplication();
+        Context context = com.huawei.android.content.ContextEx.currentApplication();
+        if (context != null) {
+            return context;
+        }
+        try {
+            Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            context = (Context) activityThread
+                    .getMethod("currentApplication").invoke(null);
+            if (context != null) {
+                return context;
+            }
+        } catch (Throwable blocked) {
+            // Expected on targetSdk>=28 callers; try the meta-reflection bypass.
+        }
+        try {
+            java.lang.reflect.Method getDeclaredMethod = Class.class
+                    .getDeclaredMethod("getDeclaredMethod", String.class, Class[].class);
+            Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method currentApplication =
+                    (java.lang.reflect.Method) getDeclaredMethod.invoke(activityThread,
+                            "currentApplication", new Class[0]);
+            Object application = currentApplication.invoke(null);
+            if (application instanceof Context) {
+                Log.i(TAG, "application context via meta-reflection");
+                return (Context) application;
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "reflection fallback failed: " + error);
+        }
+        return null;
     }
 }
