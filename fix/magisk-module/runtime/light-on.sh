@@ -11,7 +11,9 @@
 #   ① 3200x1600 白名单 bind mount（HWC mode_verify 只放行白名单内模式）
 #   ② persist.vendor.resolution.HDMI-A-0 / main = 3200x1600@70
 #      ★ 绝不动 persist.vendor.framebuffer.*：它残留会造成黑屏/假关机
-#   ③ stop surfaceflinger; sleep 2; start surfaceflinger
+#   ③ stop surfaceflinger 后【等 HWC PID 变化】再 start surfaceflinger
+#      （HWC 约 4 秒才跟随退出重启；盲等 2 秒会接回旧 HWC → 永远 1080p，
+#       2026-11-07 钉死的竞态根因，详见 ③ 段注释）
 #      ★ 绝不用 setprop ctl.restart surfaceflinger（4.2 实测整机重启）
 #   验收：Find best mode-id=4 : 3200x1600p70 / Display mode 3200x1600p70
 #         / clk[412180]
@@ -23,8 +25,9 @@
 #
 # 开机阶段不做这些动作：EDID 注入 / detect 重探 / 自动重启 HWC / 自动重启 SF
 # 都会卡 logo 或让图形会话僵死（手册 4.1、6.3、2026-11-05 崩循环复盘）。
-# 本脚本只在用户主动调用时运行；persist 属性写入后跨重启保留，开机时 HWC
-# 首次 probe 会自行选到 3200，正常情况无需每次手动跑。
+# 本脚本只在用户主动调用时运行；开机时 HWC 首次 Init 选不到 3200
+# （属性/挂载就位晚于 HWC 启动，2026-11-06/07 反复实测），所以
+# ★ 每次开机/断电后都要重跑一次本脚本点亮。
 # =============================================================================
 
 LOG=/data/local/tmp/hvr-light-on.log
@@ -114,18 +117,43 @@ log "[2/3] resolution.HDMI-A-0 / main = $RES（framebuffer.* 保持不动）"
 
 # 已经点亮就别再重启 SF：反复重启 HWC/SF 会让图形会话僵死
 # （2026-11-04 晚 Surface$OutOfResourcesException 的教训）。
-# ①/② 仍照做，保证 persist 属性就位、下次开机 HWC 自动选到 3200。
+# ①/② 仍照做，保证 persist 属性就位。
 if echo "$cur" | grep -q '3200x1600p70'; then
     log "[OK] 物理输出已是 3200x1600p70，跳过 SF 重启（避免无谓重启图形会话）。"
-    log "     resolution 属性已就位，之后开机 HWC 会自行选到 3200。"
-    echo "✅ 眼镜已点亮（3200x1600@70），无需重启；持久化属性已校正。"
+    log "     ★ 注意：重启/断电后 HWC 开机首次 Init 选不到 3200（时序问题），"
+    log "       开机后需要重跑一次本脚本。"
+    echo "✅ 眼镜已点亮（3200x1600@70），无需重启。"
     exit 0
 fi
 
 # ---------------------------------------------------------------- ③ 重启 SF
-log "[3/3] stop; sleep 2; start surfaceflinger ..."
+# 2026-11-07 竞态根因钉死：SF 停止后 HWC 约 4 秒才跟着退出（客户端死亡），
+# init 随即重启 HWC、全新 Init 会按 属性+白名单+内核模式表 选到 3200。
+# 旧版「sleep 2」太短，start surfaceflinger 把还没退出的旧 HWC 又接回去，
+# HWC 不重新 Init → 永远 1080p。历史「时灵时不灵」全是这个竞态：
+#   * 11-03 10:37 / 11-05 18:10 / 11-06 10:24 成功 = HWC 恰好来得及退出（新 PID）
+#   * 11-06 23:34 / 11-07 06:58 失败 = 旧 PID 未变
+# 现在盯住 HWC PID 变化，变了（= 全新 Init 完成）再启动 SF，一次成功。
+HWC_PID_PROP=init.svc_debug_pid.vendor.hwcomposer-2-1
+old_hwc=$(getprop $HWC_PID_PROP)
+log "[3/3] stop surfaceflinger；等待 HWC 跟随重启（PID $old_hwc -> ?）..."
 stop surfaceflinger
-sleep 2
+hwc_new=""
+i=0
+while [ $i -lt 25 ]; do
+    sleep 2
+    hwc_new=$(getprop $HWC_PID_PROP)
+    if [ -n "$hwc_new" ] && [ "$hwc_new" != "$old_hwc" ]; then
+        break
+    fi
+    i=$((i + 1))
+done
+if [ -n "$hwc_new" ] && [ "$hwc_new" != "$old_hwc" ]; then
+    log "     HWC 已跟随重启：$old_hwc -> $hwc_new（约 $((i * 2 + 2)) 秒），全新 Init 选模中"
+else
+    log "[WARN] 50 秒内 HWC 未跟随重启（PID 仍 $old_hwc），照常启动 SF，本次可能不亮。"
+fi
+sleep 3
 start surfaceflinger
 
 # 这里必须轮询，不能固定 sleep 10 就判定：
@@ -154,7 +182,7 @@ if echo "$summary" | grep -q '3200x1600p70'; then
     log "[OK] 点亮成功：$(echo "$summary" | grep -m1 'Display mode:' | tr -d '\r')"
     log "     $(echo "$summary" | grep -m1 'clk\[' | tr -d '\r')"
     [ -n "$best" ] && log "     $best"
-    log "     persist 属性已写入，之后开机 HWC 会自行选到 3200，无需每次重跑。"
+    log "     ★ 重启/断电后开机不会自动亮（HWC 开机 Init 时序问题），需重跑本脚本。"
     echo
     echo "✅ 眼镜物理输出已锁定 3200x1600@70（clk 412180）。"
     echo "   接便携屏前执行: sh /data/adb/hvrglass/light-on.sh off"

@@ -9,9 +9,16 @@
 #       off           还原原母本 + mode=auto（不重启）
 #       reboot        显式执行一次 reboot（on/off 之后手动调用）
 #
-# 为什么需要它（2026-11-05 实锤）：
+# ⚠️ 2026-11-06 修正（手册 6.12）：下面「EDID 尚未就绪」这一句已被证伪。
+#   force-off 纯直通重启实测：override=0、内核自己读到 256B `22f6` 真实 EDID、
+#   模式表含 3200x1600×2、白名单齐、resolution 属性已是 3200x1600@70，
+#   HWC 开机仍选 1920x1080p60（PID 218 未重新初始化）。所以「开机早期写
+#   override 赢过 probe」不是开机即亮的解法，EDID 注入也并非必需；
+#   真正卡在 HWC 选模逻辑本身。本工具保留作历史对照，不再推荐作为点亮手段。
+#
+# 为什么需要它（2026-11-05 当时的推断，部分已过时）：
 #   HWC 只在自身进程初始化时（开机约 6.5s）调用一次 UpdateDisplayMode，
-#   那一刻眼镜 EDID 尚未就绪 → 模式表里没有 3200 → 永远选 1920x1080p60。
+#   当时推断「那一刻眼镜 EDID 尚未就绪 → 模式表里没有 3200 → 永远选 1080p」。
 #   运行时 setprop / sys.resolution.changed / echo detect 全部证伪，
 #   stop/start surfaceflinger 虽能瞬时切 3200 却会带崩 system_server。
 #   老项目 PLAYBOX-排障操作手册 §2.2 的"开机早期写 edid_override + reboot"
@@ -117,7 +124,14 @@ echo "      status=$st  vendor=$vend  3200模式=$m3200"
 [ "${m3200:-0}" -ge 1 ] || { echo "[FATAL] 模式表里没有 3200x1600，拒绝开启"; exit 1; }
 
 echo "[2/4] 推送真实 EDID 并备份原母本"
-"$ADB" -s "$SERIAL" push "$SRC" /data/local/tmp/edid_real.bin >/dev/null 2>&1 || {
+# Git Bash/MSYS 坑（2026-11-06 实修）：
+#   - 远端参数 /data/local/tmp/... 会被 MSYS 转成 Windows 本地路径，
+#     报 remote secure_mkdirs failed: No such file or directory；
+#   - 而 $SRC 是 /f/PY/... 形式的 MSYS 绝对路径，Windows adb.exe 不认，
+#     在 MSYS_NO_PATHCONV=1 下报 cannot stat。
+# 因此在仓库根目录用相对路径，并显式禁用本次调用的参数转换。
+( cd "$ROOT" && MSYS2_ARG_CONV_EXCL='*' "$ADB" -s "$SERIAL" push \
+    ".tmp-edid/edid_live.bin" /data/local/tmp/edid_real.bin ) || {
     echo "[FATAL] push 失败"; exit 1; }
 sh_su "mkdir -p $MOD/common $DAT; \
 if [ ! -f $ORIG ]; then cp -f $BIN $ORIG 2>/dev/null; fi; \

@@ -15,10 +15,79 @@
 > **眼镜没亮 / 刷机后单独点亮**：双击 `一键点亮.bat`，或 `sh light-on.sh`
 > （自包含，不用先跑完整安装）。只体检：`sh light-on.sh <serial> check`
 >
-> **开机重启后仍不亮（HWC 开机回落 1080p）**：见手册 6.11。
-> `sh boot-light-on.sh <serial> check` 只读体检；确认只接眼镜后可
-> `on` → `reboot` 让开机早期注入真实 `22f6` EDID 赢过 HWC probe；
-> 接回普通显示器前必须 `off` → `reboot`。**默认不启用，不改开机脚本。**
+> ⚠️ **跑点亮前先开无线 adb 守护**：`sh fix/adb-keepalive.sh <serial> on`
+> `stop/start surfaceflinger` 会冲掉 adbd 的 5555 监听；而 wadb 模块的
+> 自检是「开机阶段有限 10 次、成功后即退出」，运行中掉线没人补 ——
+> 表现为设备 `ping` 得通但 adb 全断，只能手动拔电源，而拔电源又把刚
+> 点亮的 3200 清掉（2026-11-06 连着复现 4 次）。守护是纯运行时后台
+> 进程，不改开机逻辑、不改模块、重启即失效；`off` 可随时停。
+>
+> ✅ **2026-11-07 07:00 竞态根因钉死 + 修复，点亮已确定性化**：
+> `stop surfaceflinger` 后 HWC 要**约 4 秒**才跟着退出（客户端死亡），
+> init 随即重启 HWC、全新 Init 按 属性+白名单+内核模式表 选到 3200。
+> 旧版脚本 `sleep 2` 太短，`start` 把还没退出的旧 HWC 又接回去 →
+> HWC 不重新 Init → 永远 1080p。**历史「时灵时不灵」全是这个竞态**
+> （成功案例 HWC PID 都换过，失败案例 PID 不变）。修复版
+> `magisk-module/runtime/light-on.sh`（md5 `5cc4a2d4…`）改为
+> **盯住 `init.svc_debug_pid.vendor.hwcomposer-2-1` 变化再启动 SF**，
+> 2026-11-07 实测一次成功且 60 秒稳定采样全绿（`clk[412180]`）。
+> 已部署到设备 `/data/adb/hvrglass/light-on.sh`。
+> **固定用法（每次开机/断电后）**：
+> `sh fix/adb-keepalive.sh <serial> on && sh fix/light-on.sh <serial>`
+>
+> **点亮的正解在整机备份里**（`backup/box-2026-11-05/`）：
+> `hvrglass_runtime.tar.gz` / `data_adb.tar.gz` 保存着 11-05 22:33
+> 「已点亮 3200x1600p70 clk[412180] 且稳定」的完整运行时配置：
+> `mode=auto`（真实 `22f6` EDID 直通、不注入）、白名单 `528d4e07…`
+> （2 条 3200，内核真值 1663/1664）、`light-on.sh` `e3253876…`
+> （11-05 18:17 成功版）、两个 `persist.vendor.resolution=3200x1600@70`
+> （`framebuffer.*` 保持 1920x1080@60）。方法 = 白名单 bind mount →
+> 属性 → 一次 `stop; sleep 2; start surfaceflinger`，让 HWC **重新初始化**
+> 重选模。11-06 18:52 用同法复现点亮，代价是约 1 分钟后整机重启；
+> 11-05 18:10 能稳定到 22:33 是因为系统已连续运行数小时。
+> **设备已按此配方还原，本地白名单母本同步为 `528d4e07…`。**
+>
+> **2026-11-07 根因复核（修正 11-06 的定论，别再绕白名单）**：
+> `dmesg` 实测内核 HDMI 在 **0.215s** 就 probe/bind 完成，5s 之后
+> 没有任何 HPD/EDID 事件，开机后模式表一直有 2 条 3200 —— 所以
+> 「HWC 6.04s 时内核还没读到 EDID」**不成立**。真正没抢赢的是
+> **Magisk 挂载 / persist 属性时序**：`edid_boot.log` 的 post-fs-data
+> 晚于 HWC `ro.boottime=6.049s`；`/proc/<hwc>/root/...` 只证明运行时
+> 视图，证明不了 `DrmDevice::Init()` 那一刻读到什么。HWC 库里有
+> `can't find suitable Resolution Property, try to use Baseparameter.`
+> —— 首次 Init 读不到 `persist.vendor.resolution.*` 就固化 1080p。
+> 详见 `.workbuddy/memory/2026-11-07.md`。
+>
+> ⚠️ **开机早期属性补丁已实测失败，禁止再刷（2026-11-07 06:50）**：
+> `tools/make_boot_earlyprop.py` 生成的 `build/boot-hvrglass-earlyprop.img`
+> 在 ramdisk 新增 `init.rk30board.rc`（`on early-init` 提前设 resolution
+> 属性 + HWC 日志开关），只改 376 字节、kernel/second/尾部逐字节一致、
+> Magisk ramdisk 原有 17 个文件未动。**但 dd 写入 + reboot 后设备无法
+> 启动**：ping 0/10、5555 CLOSED、无 USB adb，持续 6 分钟网络栈从未起。
+> 可能原因（无串口日志，无法区分）：`on early-init` 阶段 property service
+> 未就绪时 `setprop persist.*` 致 init 失败 / header `id`(SHA1) 未随
+> ramdisk_size 更新被 bootloader 拒 / ramdisk 尾部补 0 或新增 cpio 条目
+> 致 initramfs 解析异常。**不要再试第二版 boot 补丁。**
+>
+> **回退（只刷 boot 一个分区，48MB）**：原镜像
+> `build/boot-ORIGINAL-restore.img`（= `backup/box-2026-11-05/partitions/boot.img`，
+> md5 `415b5787076d680a72933d96dc677ef1`）。
+> USB OTG 连盒子进 Loader/MaskROM → `F:\RKDevTool_Release_v2.86`
+> 【高级功能】→「按地址写镜像」，地址填 `51200`（十进制 LBA，
+> 见 `backup/box-2026-11-05/gpt_verified.tsv` 与 `flash_by_partition.bat`），
+> 选原 boot.img 写入 → `rd`/断电重插。**绝对不要点「升级固件/执行」**。
+> 本机没有 rkdeveloptool 命令行版；命令行等价为
+> `rkdeveloptool wl 51200 <原boot.img>`。
+> 实验工具：`fix/boot-whitelist.sh`（空白名单，可 `off` 回退）、
+> `fix/adb-keepalive.sh`（防 SF 重启后 5555 失联）。
+>
+> **开机即亮稳定态**（单模式 EDID + systemless 白名单 + force-vr，二·9）
+> 2026-11-06 两次受控重启实测**均未点亮**，因此 `install.sh` **默认不再部署**；
+> 需要该实验时显式 `sh install.sh <serial> stable`（`--stable-check` 体检、
+> `--stable-off` 回退）。要改开机阶段须用户明确授权。
+> ⚠️ `boot-light-on.sh` 的「开机注入真实 22f6 赢过 HWC probe」已于
+> 2026-11-06 证伪（注入 6.5s 晚于 HWC 6.03s；DDC 直通坐实 EDID 注入多余），
+> 仅作取证工具，别再当点亮手段（手册 6.11 / 6.12）。
 
 ---
 
@@ -28,6 +97,10 @@
 |---|---|---|
 | `install.sh` | **一键安装脚本**（装 APK → 部署模块 → 授权 → 一键点亮 → 验收） | — |
 | `light-on.sh` / `一键点亮.bat` | **一键点亮眼镜**（本地入口，自动 push 设备端脚本） | — |
+| `adb-keepalive.sh` / `adb-keepalive-daemon.sh` | **无线 adb 5555 运行时守护**；`on/off/check`（跑点亮前先 `on`，防 SF 重启后失联） | nohup 后台进程（重启失效） |
+| `ttyusb-compat.sh` | vcom (`/dev/ttyUSB*`) 运行时绑定 + 权限校正；`check/on/off/watch` | 运行时 sysfs（重启失效） |
+| `ddc-passthrough.sh` | DDC / EDID 直通验证；`check/passthrough/restore/reboot/verify` | `/data/adb/hvrglass/mode` |
+| `restart-hwc.sh` | HWC 选模取证；`check/restart/verify`（**勿当点亮手段**，restart 实测整机重启且无效） | — |
 | `一键修复VR框架.sh` / `一键修复VR框架.bat` | **修 VR 桌面链路**（装四个最终补丁 → 开模拟辅助显示 → 启 `.MainActivity`；`check/off/rollback/launcher`） | 手册第 8 章 |
 | `patches/vrdesktop/` | 四个最终补丁 APK（launcherx / vrservice / hvrsdkserverapp / **vrhandle-pose**）、回退基线、最小差分构建脚本 | 手册第 8 章 |
 | `apks/` | 7 个华为 VR 包，已去 sharedUserId、统一 hvr-compat 签名 | `pm install` |
@@ -51,6 +124,47 @@
    眼镜没激活时脚本自检拒绝，不会强扭）
 7. **验收**：包列表、进程列表、`vr_system` 状态
 8. **启动应用市场**冒烟（`--no-launch` 可关）
+9. **点亮配置按 11-05 备份态**（`mode=auto` / 白名单 `528d4e07…` / `light-on.sh` `e3253876…`）：见顶部说明
+   （开机即亮稳定态已证伪、默认关闭，仅显式 `stable` 才部署，见「二·9」）
+
+### 二·9 开机即亮稳定态（2026-11-06 从历史会话翻出并固化）
+
+10-30 / 11-02 曾长期稳定「重启就亮 3200x1600p70」，靠三条同时满足，
+少一条 HWC 就自造 `1920x1080p60 / clk[148500] type[40]`：
+
+| # | 条件 | 现在的差异 |
+|---|---|---|
+| ① | EDID 母本是**单 DTD、只声明 3200x1600@70** 的 256B（md5 `138fb20e…`，CEA VSDB 声明 Max TMDS 600MHz）→ 内核 `modes` 只剩一条，HWC 没法回落 | 07:36 `boot-light-on.sh on` 换成真实 `22f6` 多模式 EDID（`eba6de4e…`），`modes` 变 10 条含 1080p60 |
+| ② | 白名单 `resolution_white.xml` 走 **Magisk systemless overlay**（模块 `system/usr/share/`），开机挂载阶段就位 | 现在只靠 `post-fs-data.sh` 运行时 bind mount，实测 6.5s 晚于 HWC 6.03s 的 `init_white_modes()` |
+| ③ | `mode=force-vr` 无条件注入 | 已是 force-vr |
+
+```sh
+sh install.sh <serial> --stable-check   # 只读：母本 md5 / overlay / mode / modes / 物理时序
+sh install.sh <serial> stable           # 只部署三件套：不装 APK、不重启、先备份
+#   → 手动重启一次（眼镜 HDMI + USB 保持插着）
+sh install.sh <serial> --stable-off     # 回退母本 / overlay / mode，再重启
+```
+
+只写数据文件与开关，**不改开机脚本逻辑、不动 system 分区、不刷机**；
+`--with-overlay` 那个会卡 logo 的 `public.libraries.txt` 整体替换是另一回事，
+仍默认关闭。接普通显示器前务必 `--stable-off`，否则会被骗成只支持 3200。
+
+**⚠️ 2026-11-06 22:45 真机证伪（两次受控重启，结论一致）**：三件套全部生效后
+仍不亮。`modeinfo` 读到的内核唯一模式是
+`3200x1600 clock=412180 h=3200/3260/3268/3308 v=1600/1613/1614/1780 flags=0x5`；
+HWC 进程命名空间里白名单 md5 与 adb 侧一致、含 3 条 3200（含专为单模式 EDID
+补的 `vsync 1613/1614` 变体）；`mode=force-vr`；但 `supportedModes` 仍只有
+`[{1920x1080@60}]`，VOP 仍是 `1920x1080p60 / clk[148500] type[40]`（HWC 自造模式）。
+六字段全等、全字段变体也都试过 → **不是字段匹配问题**。结合 07:36 时序证据
+（HWC 由 `late-fs` 在开机 6.03s 启动并 `DrmDevice::Init()`，post-fs-data 的
+EDID 注入/白名单在约 6.5s，晚 0.4s），根因是 **HWC 首次 Init 时既没读到
+含 3200 的白名单、内核也还没给它 3200 模式，之后不再重读**；Magisk
+systemless overlay 也没抢赢这一刻。
+
+→ 纯数据层/运行时层到此为止，**剩下只能改开机阶段**（让 EDID + 白名单都早于
+HWC 6.03s，或让 HWC 读到空白名单触发 `mode_verify` 全放行）。这触及
+「不擅自改开机逻辑」硬约束，需用户明确授权后再动。`stable` / `--stable-off`
+作为可逆部署能力保留，供授权后的方案直接复用。
 
 模块的 EDID 逻辑（`post-fs-data.sh`，开机执行）：
 
@@ -169,11 +283,54 @@ sh fix/一键修复VR框架.sh <serial> rollback     # 装回四个原版基线
 `App activity is null` / `VRPromptActivity` 全 0；栈顶保持
 `com.huawei.vrlauncherx/.MainActivity`。
 
-**剩余阻塞（未解，手册第 8 章）**：约 2 分钟后 `ArvrRuntimeService` ANR →
-launcherx 重启 → vrservice 弹 `ServiceTermActivity` 因 compat 桩类缺
-`WindowManagerEx$LayoutParamsEx.setDisplaySideMode(I)V` 崩溃 → `onDestroy` 空指针
-→ 级联回落；另有 `VRRenderWalleImpl: No valid frame to display`（窗口 surface 未就绪）。
-`E VrHelmetExt: mVRDeviceExt is null` 经 PATCH_AUDIT 16.3 定性为 3DoF 分支噪声，不阻塞。
+**2026-11-06 已清零的级联崩溃（详见手册 8.4 改写段）**：
+
+| 层 | 根因 | 修法（工具） |
+|---|---|---|
+| 1 | `WindowManagerEx$LayoutParamsEx.setDisplaySideMode(I)V` 缺失 | `vrdesktop/add_set_display_side_mode.py`（vrservice + launcherx 的 `classes4.dex`） |
+| 2 | `ServiceTermActivity` 的 `InflateException`：EMUI `androidhwext` `?0x0201xxxx` 私有属性在 AOSP 解析失败（且是 `TYPE_ATTRIBUTE=0x02`，不是 9 月脚本处理的 `0x08`） | `vrdesktop/inline_hwext_attrs.py`（9 个布局、103 处内联） |
+| 3 | `ArvrRuntimeService.onDestroy()` 的 `j.deinit()` NPE、`unregisterReceiver(null)` → `Receiver not registered: null` | `vrdesktop/fix_runtime_ondestroy.py`（两处判空） |
+| 4 | **真正的总根因**：compat 早先把 `onCreate()` 整个短路成 `VrSystemActor.start() + return-void`，原厂 `b()`（`startForeground`）永不执行 → `startForegroundService()` 超时 ANR → AMS 杀进程 → `VrSystemActor` / `vr_system_state` 消失 → `Force removing ... vrlauncherx/.MainActivity` → `VRService` 判定头盔掉线拉 `ServiceTermActivity` | 同一脚本在短路前补回 `invoke-direct b()V`，不改其余逻辑 |
+| 5 | `VRService.installVrApp()` → `checkCurrentComponentsExist()` 遍历 6 个必需包，真机只缺 `com.youku.vr` → 弹安装向导 | `vrdesktop/make_youku_stub.py` 生成 8.5KB 只声明包名的占位包，`adb uninstall com.youku.vr` 即可回退 |
+| 6 | 用户协议点「同意」不落盘：`VRUtils.isInstallAgreementAccepted()` 查 `SharedPreferenceProvider` 恒为 `agreement=false`，15 秒一轮 `Need to reapply for user agreement authorization` | `content insert --uri content://com.huawei.vrinstaller.provider.sharedpreferenceprovider/setBoolean/com.huawei.vrinstaller_preferences --bind agreement:b:true`（一键脚本已内置） |
+| 7 | vrservice 的 `sendMessageToClient(I, Object)` 把 `Integer`(0x3ea) / `Boolean`(0x3ed) 直接塞进 `Message.obj`；`Message.writeToParcel` 只接受 Parcelable，跨进程抛 `Can't marshal non-Parcelable objects across processes` 杀掉 `VRWorkerThread`（共 13 个发送点） | **`vrdesktop/fix_messenger_payload.py`**（双包）：vrservice 把标量载荷编进 `Message.data` Bundle、`obj` 置 null；launcherx 在 `t0/c$b.handleMessage` 分发前还原 `obj`。`fix_prepare_msg.py` 已废弃 |
+| 8 | 单包「置 null」补丁的回归：接收端 `t0/c.D` 非 2/4 分支仍 `check-cast Integer` → `Integer.intValue()` NPE；`handleEarphonePlugged` 继续发 `Boolean` → marshal 崩溃，每 ~30s 一轮 8 个 FATAL | 同一个 `fix_messenger_payload.py` 通用修复（覆盖全部发送点 + 接收端按类型还原） |
+
+> **结论修正（重要）**：早先记录的「第 5 轮 100–130 秒窗口栈顶稳定
+> `com.huawei.vrlauncherx/.MainActivity`、`UnityMain` 持续渲染、3D 桌面已驻留」
+> 是 `fix_prepare_msg.py` 把 `obj` 置 null 后**误导 proximity 判断**造成的短时假象；
+> 随后完整 logcat 复核出每 ~30s 一轮 8 个 FATAL。该结论作废，
+> **不能作为「已进 VR 桌面」的依据**。
+
+**真机复验（2026-11-06 07:36–07:53）**：装双包后清 logcat，180 秒窗口
+`FATAL=0 / Can't marshal=0 / Integer.intValue NPE=0 / ANR=0 /
+startVrInstaller=0 / ServiceTerm=0 / PrepareQuit=0 / NeedReapply=0 /
+CheckVRModeFail=0 / ForceRemove=0`，`System prepare done, start vr.` 正常出现，
+证明 0x3ea 载荷已送达并被处理；后续再观察 255 秒仍全 0。
+
+**仍剩（未解，下一层）**：
+
+1. **物理层 vcom 缺失**：`/dev/ttyUSB*` 不存在，日志 `5 times can not open
+   vcom, stop try.`，`getProximityNativeJNI()` 恒为 -1；接收端 `t0/c.P(I)` 只有
+   `p1==1` 才启动 3D 桌面，否则 `helmet away now, wait for proximity msg to
+   start.` → 栈顶停 `VRPrepareActivity`、`UnityMain=0`。
+   `fix_messenger_payload.py` 内含 `HvrProximityCompat`（读数 <=0 时按「已佩戴」
+   置 1，读数 >0 时保留原值），**已装机但尚未验证**（见第 2 条）。
+2. **冷启动缺 USB attach 事件**：`doHelmetPrepare()` 只由进程内
+   `glass.connectdone` 之后调用，`UsbReceiver` 只认真实
+   `android.hardware.usb.action.USB_DEVICE_ATTACHED`；软件强制重启服务后
+   `heartbeat not init, wait.` 可持续数百次而不进入 prepare。需物理拔插眼镜
+   USB / 电源，或授权触发一次 display 事件（会改 displayId，不是正式修法）。
+3. 眼镜物理输出仍是 `1920x1080p60 / clk[148500]`，未点亮到
+   `3200x1600p70 / clk[412180]`；点亮配方有效但 `stop/start SF` 后约 100 秒
+   整机重启回落，属另一条线。
+4. `VrSystemActor` 只在 `start()` / display 事件 `refresh()`，冷启动若 USB 判据
+   未就绪不再重查；实测重插一次辅助屏可让 `0x3e9` 握手 → `0x1 / 0xf / 0xf / 0x3eb`
+   整条跑通，但会改变 displayId（`VRUtils` 写死 displayId1），不能当正式修法。
+5. `E VrHelmetExt: mVRDeviceExt is null` 经 PATCH_AUDIT 16.3 定性为 3DoF 分支噪声，不阻塞。
+
+**回退**：`python fix/patches/vrdesktop/fix_messenger_payload.py --restore`
+同时撤销 messenger 修复与 `HvrProximityCompat`，恢复到 `*.pre-messenger.apk`。
 
 ### 4. appops `SYSTEM_ALERT_WINDOW` 对 4 个包不生效
 
@@ -210,6 +367,27 @@ adb logcat -d | grep -E "FATAL|AndroidRuntime|NoClassDefFoundError|InflateExcept
 adb shell su -c 'head -8 /sys/kernel/debug/dri/0/summary'   # 看 p60/p70/p90
 adb shell su -c 'cat /sys/kernel/debug/dri/0/summary' | grep -A3 VOP   # 看 src/dst 几何
 ```
+
+### 8. 想验证「不注入 EDID、内核自己读 DDC」是否可行（2026-11-06 已坐实）
+
+转接器独立供电后 DDC 是通的：**override 为 0 字节**时，内核自己读到
+256B、厂商 `22f6`、md5 `eba6de4e…` 的眼镜真实 EDID，模式表含
+`3200x1600 ×2`；HPD 重读后仍是同一份。也就是说 EDID 注入是多余的。
+**但这不等于点亮**：同一次开机白名单齐、resolution 属性已是
+`3200x1600@70`，HWC 仍输出 `1920x1080p60`，卡点在 HWC 选模而非 EDID。
+详见手册 6.12。
+
+```sh
+sh fix/ddc-passthrough.sh <serial> check         # 只读判据 + 自动判定
+sh fix/ddc-passthrough.sh <serial> passthrough   # 备份 mode → force-off（不重启）
+sh fix/ddc-passthrough.sh <serial> reboot        # 显式重启
+sh fix/ddc-passthrough.sh <serial> verify        # 重启后完整判据
+sh fix/ddc-passthrough.sh <serial> restore       # 恢复验证前的 mode
+```
+
+⚠️ 不要移走/改名 `edid_only.bin`：`post-fs-data.sh` 开头
+`[ -f "$BIN" ] || exit 0`，文件没了会让 `HUAWEI` 伪装、`ro.vr.surport`
+和白名单 bind mount 一起失效。用脚本原生的 `force-off` 分支才干净。
 
 ## 五、以后怎么改 APK 重出包
 

@@ -46,6 +46,11 @@ echo "$(date) service.sh 启动" >> "$LOG"
 # 点亮问题应回到眼镜侧：手册 4.3 —— 眼镜有粘性激活态，失活后先用 PC/手机
 # 点亮一次再插回盒子；EDID 指纹 22d2=转换器默认（眼镜没醒）、22f6=HWV 真实。
 
+# --- vcom 节点兼容开关（2026-11-06）---
+# 只有 /data/adb/hvrglass/ttyusb_compat 文件存在时才启用；默认关闭，
+# 不改变既有行为。详见 fix/ttyusb-compat.sh 头部说明。
+TTYUSB_REGISTERED=0
+
 while true; do
     for h in /dev/hidraw*; do
         [ -e "$h" ] || continue
@@ -91,6 +96,31 @@ while true; do
         # 眼镜拔出后 hidraw1 消失，摘掉死链，等插回再建
         rm -f /dev/hwvr1
         echo "$(date) hwvr1 死链清除（hidraw1 消失）" >> "$LOG"
+    fi
+
+    # --- /dev/ttyUSB* vcom 节点（2026-11-06 新增，受开关控制）---
+    # 12d1:107e 的 3 个 vendor bulk 接口在通用内核里没有驱动绑定，
+    # 因此永远不生成 /dev/ttyUSB0；VRService 的 UpgradeGlass.cpp 硬编码
+    # open("/dev/ttyUSB0")，失败 5 次后放弃 -> heartbeat not init 死循环
+    # -> proximity -1 -> 3D 桌面不启动。
+    # 写 VID/PID 到 usbserial_generic 的 new_id 可让驱动接管并生成 ttyUSB0/1/2；
+    # HID 接口无 bulk 端点会被驱动跳过，/dev/hwvr1 symlink 不受影响。
+    # 眼镜 USB 每次重枚举都会重建节点并把权限打回 0660，故每轮校正。
+    if [ -f /data/adb/hvrglass/ttyusb_compat ]; then
+        if [ "$TTYUSB_REGISTERED" = "0" ] && \
+           [ -w /sys/bus/usb-serial/drivers/generic/new_id ]; then
+            echo "12d1 107e" > /sys/bus/usb-serial/drivers/generic/new_id 2>/dev/null &&
+                TTYUSB_REGISTERED=1 &&
+                echo "$(date) ttyusb_compat: new_id 已注册" >> "$LOG"
+        fi
+        for t in /dev/ttyUSB*; do
+            [ -e "$t" ] || continue
+            perm=$(stat -c '%a' "$t" 2>/dev/null)
+            if [ "$perm" != "666" ]; then
+                chmod 666 "$t" 2>/dev/null &&
+                    echo "$(date) $t $perm -> 666" >> "$LOG"
+            fi
+        done
     fi
     sleep 3
 done
