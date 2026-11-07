@@ -999,3 +999,69 @@ USB 链路层的进程级联，软件只能缩短恢复、消不掉抖动本身�
 > `/config/usb_gadget/g1/UDC`（60 秒日志内分别 63 次 / 254 次），怀疑持续
 > 扰动 USB 控制器。修它要动系统属性，**有中断无线 adb 的风险，未做**，
 > 需现场确认后再试。硬件侧仍需检查线缆、Type-C 转接与 hub 供电。
+
+### 11.10 6DoF 与 3DoF 是两条独立链路（2026-11-08 用户纠正）
+
+> 用户指出 **HUAWEI CF20 是 3DoF 手柄**，要求回 `系统/` 核对原厂怎么识别 6DoF。
+> 核对后确认：此前把 `Huawei 6Dof ... is false` 当作「手柄掉线」是错的，
+> 两者毫无关系。依据 `docs/6DoF-为什么没起来.md` 第五章与
+> `build/tmp/ctxa/dexdump/hvrfw/com/huawei/vrframework/VrParamsRequester.smali`。
+
+**6DoF（设备 = `12d1:3a09` 6DoF Gaming Kit Par-CG012 / Omnivision 双目 UVC）**
+识别不在内核、不按 VID/PID、也不走蓝牙，而在上层 Java：
+
+```
+VrParamsRequester.isHW6DoFAvailable(int index)  // smali 第 162 行
+  ① mRuntimeInterface (ArvrRuntimeInternalInterface) != null   // null 直接 return false
+  ② getCurrentDevices() 返回的 List<DeviceInfo>.size() == 3     // 头 + 左 + 右
+  ③ list.get(index).getDeviceState() == 1
+  index: 0 = Header(Huawei 6Dof Header) / 1 = left / 2 = right
+  左右都 true 才整体 true（smali 第 608-619 行）
+```
+数据链：USB UVC `class 0e/02`(VideoStreaming) → `/dev/video14/15`
+→ HiVRAR HAL（`系统/tree/system/system/lib64/libhivrar_service.so`、
+`vendor.huawei.hardware.hivrar@2.x.so`）→ VIO 位姿 → `ArvrRuntimeService`
+的 `getCurrentDevices()`。`系统/` 里这些 HAL/so **没有任何 `6DoF`/`CF20`
+字面量**，判定全在上层；`hvrsdkserverapp` 里也没有 `BluetoothGatt`。
+绑定动作是 `VrParamsRequester.bindRuntimeService()` 用 action
+`com.huawei.hvrsdkserverapp.service.ACTION_GET_INTERNAL_INTERFACE` 去
+`bindService`，`ArvrRuntimeService.onBind()` 校验 `RUNTIME_ALLOW` 权限后返回 binder。
+
+**3DoF（设备 = HUAWEI CF20 / BLE）**：`com.huawei.vrhandle` 按广播名
+`contains("CF20_3DOF")` 过滤，私有 GATT `622f5b2a` / `ffb4a651`，入库
+`shared_prefs/sp_device_storage.xml`。与 6DoF 完全独立，见第九章。
+
+**真机实测（2026-11-08 05:24–05:26）**
+
+| 项 | 结果 |
+|---|---|
+| 6DoF 模组 USB | `1-1.3:1.0` = `0e 01`(VC)、`1-1.3:1.1` = **`0e 02`(VS，齐了)**、`1-1.3:1.2` = `03 00`(HID) |
+| 6DoF 视频节点 | `/dev/video14`、`video15` = `6DoF Gaming Kit Par-CG012: 6DoF`，权限 666（守护改的） |
+| 6DoF 仍判 false | **`mRuntimeInterface == null` 783 次** —— `isHW6DoFAvailable()` 第一行就 return false，与摄像头是否通无关 |
+| CF20 手柄 | `05:24:35 CONNECTED f7:2d:dd:63:45:ab`、`device is already connected`、`Controller Disconnected=0` → **已连接** |
+| 复核瞬态 | 稍后再查整条 USB 下游消失（只剩 4 个 root hub，`hidraw=0`、`video=0`），属 11.7 的间歇重枚举 |
+
+所以 `Huawei 6Dof ... false` 是本机**既有状态**（手册 8.3 已定性为 3DoF
+眼镜的分支噪声），不能拿来解释「应用打不开」。真正的第三个缺口是
+`ACTION_GET_INTERNAL_INTERFACE` binder 没绑定成功（手册 8.4 提到的
+`onBind()` 死代码另一半），尚未修。
+
+**「ALVR / 其他应用打不开」复核**：`am start` 下 ALVR、应用市场、华为视频、
+投屏 **4 个全部 `Status: ok` 并驻留**，`FATAL=0`、`ForceProcessExit=0`；
+桌面 UI 正常渲染、图标齐全。但 `input tap` / `keyevent` 均 `START u0=0`,
+`launchApp=0`，同时 `HVRInputModule.UpdateAnchorPos` 持续空引用、
+`WalleDev: No Glass data` 刷屏 → 射线指针命中判定异常。adb 触摸/按键不映射
+手柄射线，**需用户用手柄实点一次图标、同步抓 logcat** 才能区分
+「输入没收到」与「启动被拦」。应急启动见 11.11 的工具。
+
+### 11.11 两个只读/应急工具
+
+```sh
+sh fix/tools/vr-input-check.sh 192.168.43.133:5555          # 分 A(6DoF) / B(CF20) / C(Unity 射线) 三段体检，只读
+sh fix/tools/open-vr-app.sh   192.168.43.133:5555 list       # 列出所有 VR 包与真实入口
+sh fix/tools/open-vr-app.sh   192.168.43.133:5555 alvr       # 不依赖手柄，直接开 ALVR
+```
+各包入口不是 `MainActivity`（写死会报 `Activity class does not exist`），
+脚本用 `cmd package resolve-activity --brief` 动态解析。别名：
+`desktop / alvr / market / cast / himovie / youku`。
+USB 重枚举瞬态会让 6DoF 探测读数为空，脚本自动隔 3 秒复采一次。
