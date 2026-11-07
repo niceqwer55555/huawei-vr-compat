@@ -63,10 +63,40 @@ FH=$(count '6Dof Header is false')
 FL=$(count '6Dof left controller is false')
 echo "    mRuntimeInterface == null = $NULLBIND 次   ← 非 0 时 isHW6DoFAvailable 第一行就返回 false"
 echo "    Huawei 6Dof Header/left false = $FH / $FL 次"
-if [ "${NULLBIND:-0}" -gt 0 ]; then
-    echo "    [INFO] 即便摄像头链路已通，6DoF 仍会判 false：卡在 Runtime 内部 binder"
-    echo "           (ACTION_GET_INTERNAL_INTERFACE / RUNTIME_ALLOW 权限，"
-    echo "            见 decode/.../ArvrRuntimeService.smali onBind)。"
+
+# --- 6DoF binder 链（2026-11-08 第五轮补）：把「绑定没发生」和「权限被拒」分开 ---
+# 之前把断点笼统归到 RUNTIME_ALLOW 权限，实测证伪：设备上
+#   com.huawei.android.permission.VR = granted=true，
+#   com.huawei.hvrsdkserverapp.permission.RUNTIME_ALLOW = granted=true，
+#   onBind 的 isVrMode 判断也已被 patch 成常量 true（死代码）。
+# 真正链路：眼镜在位 → IVRSystemServiceManager.isVRMode()=true
+#   → ArvrRuntimeService.onCreate 初始化 j(manager) → VrFramework$System.register()
+#   → TemperatureReceiver.register() → VrParamsRequester.bindRuntimeService()
+#   → ArvrRuntimeService.onBind(ACTION_GET_INTERNAL_INTERFACE) → binder
+#   → onServiceConnected 赋 mRuntimeInterface → isHW6DoFAvailable() 才有机会 true
+BIND=$(count 'bind RuntimeService')
+ONBIND=$(count 'ArvrRuntimeService: onBind')
+PERMDENY=$(count 'not Internal permitted')
+MGRNULL=$(count 'mManager == null')
+CHKVR=$(count 'checkVRMode fail')
+NOCTX=$(count 'no application context')
+HYD=$("$ADB" -s "$SERIAL" shell 'ls /dev/hidraw* 2>/dev/null | wc -l' 2>/dev/null | tr -d '\r')
+VRSYS=$("$ADB" -s "$SERIAL" shell 'timeout 4 content call --uri content://com.huawei.vrlauncherx.registry --method getService --arg vr_system 2>/dev/null | head -1' 2>/dev/null | tr -d '\r')
+echo "    --- 绑定链判据 ---"
+echo "    hidraw 节点数 = ${HYD:-0}          （0 = 眼镜 USB 未枚举，最上游）"
+echo "    vr_system 注册表 = ${VRSYS:-（读不到）}"
+echo "    checkVRMode fail / no application context = $CHKVR / $NOCTX 次"
+echo "    bind RuntimeService / onBind / not Internal permitted = $BIND / $ONBIND / $PERMDENY 次"
+echo "    mManager == null = $MGRNULL 次   （RuntimeService 的 manager 没初始化）"
+if [ "${BIND:-0}" -eq 0 ] && [ "${HYD:-0}" -eq 0 ]; then
+    echo "    [结论] 眼镜 USB 物理离线 → isVRMode=false → manager 不初始化 → 绑定从未发起。"
+    echo "           这不是 binder/权限缺口；软件侧 (vr_system / 权限 / onBind) 都已就位。"
+elif [ "${BIND:-0}" -eq 0 ]; then
+    echo "    [结论] 眼镜在位但 VrFramework\$System.register() 未触发绑定，查 SDK init 路径。"
+elif [ "${PERMDENY:-0}" -gt 0 ]; then
+    echo "    [结论] onBind 权限被拒，检查 com.huawei.android.permission.VR 授予状态。"
+elif [ "${MGRNULL:-0}" -gt 0 ]; then
+    echo "    [结论] RuntimeService manager 未初始化，查 isVRMode() / vr_system 可达性。"
 fi
 
 # ---------- B. 3DoF CF20 手柄 ----------
@@ -90,11 +120,12 @@ echo "=== 判定（三项互相独立，不要交叉归因） ==="
 if [ "${VS:-0}" -eq 0 ]; then
     echo "[A][FAIL] 6DoF 模组没有 VideoStreaming 接口 → 无位姿数据 → 6DoF 恒 false。"
 else
-    echo "[A][OK]   6DoF 模组硬件链已通（VS 接口 + video 节点）；若仍 false 是上层 Runtime binder 未绑定。"
+    echo "[A][OK]   6DoF 模组硬件链已通（VS 接口 + video 节点）；若仍 false，按上面「绑定链判据」逐环定位。"
 fi
 if [ "${NULLBIND:-0}" -gt 0 ]; then
     echo "[A][WARN] mRuntimeInterface 为 null —— 这是 VrParamsRequester 判 6DoF false 的直接原因，"
     echo "          与 CF20 手柄无关；同时会影响 queryVrStartTime / requestThermalParams 等接口。"
+    echo "          注意：当前多为「绑定从未发起」（眼镜离线 → isVRMode=false），不是权限/binder 缺口。"
 fi
 echo "[B] 看上面 bluetooth 最近记录：CONNECTED = CF20 已连；只有 DISCONNECTED 才需要"
 echo "    手柄开机/唤醒/充电（AutoScanCompat 每 60s 自动扫，见 fix/README.md 第九章）。"

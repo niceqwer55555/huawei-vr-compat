@@ -70,6 +70,8 @@ STATE_LAST_CHECK=0
 STATE_REPAIR_LAST=0
 # hidraw 全部消失的连续轮数（EMI 重枚举瞬态宽限，见主循环）
 MISS=0
+# 无线 adb 5555 自愈巡检时间戳（见主循环末尾，2026-11-08 第五轮）
+ADB_GUARD_LAST=0
 
 while true; do
     for h in /dev/hidraw*; do
@@ -287,5 +289,37 @@ while true; do
             fi
         done
     fi
+
+    # --- 无线 adb 5555 自愈（2026-11-08 第五轮，面具模块侧兜底）---
+    # 背景：wadb 模块只在开机做「有限次」重拉（10 次 / 6s）后就退出，
+    #   运行时任何把 adbd TCP 监听冲掉的事件（init 重配 usb gadget、误改
+    #   sys.usb.config、adbd 崩溃）都会让 5555 永久关闭 —— 设备 ping 得通
+    #   但 adb 连不上，只剩拔电源救砖。hvrglass 是设备上唯一常驻循环，
+    #   在这里低频兜底，补上 wadb 的运行时空窗。
+    # 只在端口确实没监听时动作，每 60 秒最多一次；用 ctl.stop/ctl.start 走
+    #   init 级重拉，不用裸 kill（与 wadb 模块同一套写法）。
+    # 开关：touch /data/adb/hvrglass/wadb_guard_off 可整体关闭。
+    #
+    # ⚠️ 严禁在模块里改 sys.usb.config / persist.sys.usb.config：
+    #   2026-11-08 A/B 实证：setprop sys.usb.config none 会立刻打断唯一的
+    #   无线 adb 通道（ping 0% 丢包、5555 拒绝连接，且 wadb/守护都没能
+    #   自动恢复）。/sys/class/udc 空 + sys.usb.controller 空造成的 gadget
+    #   配置残缺，目前没有软件侧安全修法，只能现场查线缆 / Type-C 转接 /
+    #   hub 供电 / 环境干扰。不要再拿唯一调试通道做这类实验。
+    if [ ! -f /data/adb/hvrglass/wadb_guard_off ]; then
+        GUARD_NOW=$(date +%s)
+        if [ $((GUARD_NOW - ADB_GUARD_LAST)) -ge 60 ]; then
+            ADB_GUARD_LAST=$GUARD_NOW
+            if command -v netstat >/dev/null 2>&1 && \
+               ! netstat -tln 2>/dev/null | grep -q ':5555'; then
+                setprop service.adb.tcp.port 5555
+                setprop ctl.stop adbd 2>/dev/null
+                sleep 1
+                setprop ctl.start adbd 2>/dev/null
+                echo "$(date) [adb-guard] 5555 丢失 -> init 级重拉 adbd" >> "$LOG"
+            fi
+        fi
+    fi
+
     sleep 3
 done

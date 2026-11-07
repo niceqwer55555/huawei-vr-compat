@@ -1025,7 +1025,11 @@ VrParamsRequester.isHW6DoFAvailable(int index)  // smali 第 162 行
 字面量**，判定全在上层；`hvrsdkserverapp` 里也没有 `BluetoothGatt`。
 绑定动作是 `VrParamsRequester.bindRuntimeService()` 用 action
 `com.huawei.hvrsdkserverapp.service.ACTION_GET_INTERNAL_INTERFACE` 去
-`bindService`，`ArvrRuntimeService.onBind()` 校验 `RUNTIME_ALLOW` 权限后返回 binder。
+`bindService`，`ArvrRuntimeService.onBind()` 校验
+`com.huawei.android.permission.VR` 后返回 binder。
+（旧记录写的是 `RUNTIME_ALLOW` 权限，11.14 已实证更正：两个权限在设备
+上都是 `granted=true`，且 `onBind` 的 `isVrMode` 判断早已 patch 成常量
+true；断点不在这里。）
 
 **3DoF（设备 = HUAWEI CF20 / BLE）**：`com.huawei.vrhandle` 按广播名
 `contains("CF20_3DOF")` 过滤，私有 GATT `622f5b2a` / `ffb4a651`，入库
@@ -1238,3 +1242,93 @@ sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 restore  # 回滚（修改�
 2. 若要让 `dual` 生效，patch `externalDisplay()` / `HvrPanelFinder` 按面积选大屏。
 3. 跨进程（Runtime 建屏）路径仍需按 `docs/PROJECT_STATUS.md` 第 9 条启用
    LSPosed 模块；该操作涉及刷框架组件 + 重启，**未执行**，需用户确认。
+
+### 11.14 眼镜不点亮 / 6DoF 激活指令 / 面具插件能做什么（2026-11-08 第六轮）
+
+用户追问「眼镜没点亮」「6DoF 手柄是不是需要激活指令」「改用面具插件不行吗」。
+本轮把三条线合到一起，结论是**它们指向同一个循环依赖**。
+
+#### 眼镜点亮的激活链（现场实证）
+
+```text
+/dev/hwvr1 -> hidraw1 (descLen=68, 12d1:107e 控制口)   ← 守护选点正确
+  -> libWalleDev.so ioGetVendorInfo(): HIDIOCGFEATURE(4) / report 1
+  -> 激活命令 HIDIOCSFEATURE(5)
+  -> 日志 "active device(2) OK" → 眼镜面板点亮
+```
+
+11.8 已修过「节点指错 hidraw0(CV10, 28B)」导致 `ioGetVendorInfo` 恒失败的坑。
+本轮重启后的现场：hidraw0~4 全部枚举（含 `hidraw3 = 6DoF Gaming Kit
+Par-CG012` 的 `06ffa0` 接口）、`/dev/hwvr1 -> /dev/hidraw1 (descLen=68)`、
+`video14/15` 与 `ttyUSB0-2` 权限全 666、HDMI `connected` 且首选
+`3200x1600` —— **面具模块侧每一环都是对的**。但 14 秒观测窗口里
+`active device` / `ioGetVendorInfo` / `HIDIOCSFEATURE` 计数**全为 0**：
+激活指令根本没发出去。所以黑屏不是 EDID / 分辨率 / 节点权限问题。
+
+> 现场应急仍按手册 4.3：眼镜有粘性激活态，失活后先用 PC/手机点亮一次再插回
+> 盒子。这能绕过本机发不出激活指令的局面。
+
+#### 6DoF 需不需要激活指令：需要，且与眼镜共用上游
+
+- 6DoF 三设备头/左/右的上报走 `VrInteractiveDeviceManager`（`mVRDeviceExt`）
+  → `getCurrentDevices()` → `ArvrRuntimeInternalInterface`；
+- `ArvrRuntimeModuleManager.updateHandleLight(I)` →
+  `updateHandleLightNative(I)` 是点亮/激活手柄的 native 指令，但它在
+  `service/f`（就是一直报 null 的那个 manager）里；
+- **循环依赖（本轮定位）**：
+  `VrHelmetExt.isEnable()` 里 `mVRDeviceExt == null` 时，只有
+  `VrFramework.isHW6DoFHeaderAvailable()` 为 true 才会创建它；而后者
+  → `VrParamsRequester.isHW6DoFAvailable(0)` → 第一行
+  `mRuntimeInterface == null` 就 return false。于是设备管理器永远建不起来，
+  激活指令不发、眼镜不亮、6DoF 设备不上报，`mRuntimeInterface` 继续 null。
+  现场每帧刷 `VrHelmetExt: mVRDeviceExt is null` 就是这个死锁。
+
+#### 修正 11.10 的旧结论（权限/binder 不是断点）
+
+之前把 6DoF 归到「`ACTION_GET_INTERNAL_INTERFACE` binder 缺口 /
+`RUNTIME_ALLOW` 权限」。本轮逐条证伪：
+
+| 项 | 实测 |
+|---|---|
+| `com.huawei.android.permission.VR` | `granted=true`（`checkCallingOrSelfPermission` 是「调用方或自己」，服务端自己也持有） |
+| `RUNTIME_ALLOW` | `granted=true` |
+| `ArvrRuntimeService` 三处 `isVrMode` 判断 | `onCreate` / `onBind` / `onStartCommand` **均已 patch 成常量 true** |
+| `vr_system` 注册表 | `binder=android.os.BinderProxy@...`，已发布 |
+| `isVRMode` | `HvrSdkBridge: getVRModeState -> 1 isVRMode=true` |
+| 绑定 | `dumpsys activity services` 有 `ACTION_GET_INTERNAL_INTERFACE` 的 `ConnectionRecord`（binding 来自 vrlauncherx），`bind RuntimeService suc.` / `onBind` 均出现 |
+| `VrFrameworkBootstrap` | `framework=true helmet=false`，`VrFramework.init` 已执行 |
+| 仍失败 | `mRuntimeInterface == null`、`runtimeBinder is null`、`Huawei 6Dof Header/left/right is false` |
+
+所以软件侧「注册/权限/绑定」都已就位，剩下的不是再装什么框架，而是
+`VrHelmetExt` 那个循环依赖（SDK 内部 Java/native 逻辑），需要单独 patch
+`hvrframework.dex` 打破。
+
+#### 面具插件（Magisk）能做什么 / 不能做什么
+
+| 能力 | 归属 | 现状 |
+|---|---|---|
+| EDID 注入、HWC 分辨率白名单 bind mount、平台伪装 | Magisk `post-fs-data.sh` | 生效（HDMI 首选 3200x1600） |
+| hidraw / 6DoF video / ttyUSB 权限、hwvr1 选点、state 发布、开机拉服务 | Magisk `service.sh` | 生效（见上） |
+| 显示路由的跨进程放行 | Java hook（Zygisk/LSPosed） | **已不需要**：13 章的 panel-bootstrap 让启动方自己建屏，同 uid 放行 |
+| 6DoF / 眼镜激活的 `VrHelmetExt` 循环依赖 | SDK 内部 Java/native | **Magisk 做不了，LSPosed 也不是对症解**，需 patch `hvrframework.dex` |
+
+一句话：**面具插件该做的都做了且生效，不用改装 LSPosed；剩下的断点在 SDK
+Java 层，既不是 Magisk 也不是 LSPosed 的能力范围。**
+
+本轮给 `service.sh` 补了「无线 adb 5555 自愈」：`wadb` 模块只在开机做有限
+10 次重拉就退出，运行时 adbd 的 TCP 监听一旦丢失就永久失联（只剩拔电源）。
+hvrglass 是唯一常驻循环，现每 60 秒检查一次、端口没了才用
+`ctl.stop/ctl.start adbd` 重拉；`touch /data/adb/hvrglass/wadb_guard_off`
+可关闭。已 root 部署到设备模块目录，**下次重启生效**。
+
+> ⚠️ **禁止在模块里改 `sys.usb.config`**：本轮做过一次自动回滚的 A/B，
+> `setprop sys.usb.config none` 立刻打断唯一无线 adb 通道（ping 0% 丢包、
+> 5555 拒绝连接，wadb 与守护都没能自愈，最后靠用户拔插电源恢复）。
+> `/sys/class/udc` 空 + `sys.usb.controller` 空造成的 gadget 配置残缺目前
+> 没有软件侧安全修法，只能现场查线缆 / Type-C 转接 / hub 供电。
+
+`fix/tools/vr-input-check.sh` 的 A 段同步增强：修正旧的「RUNTIME_ALLOW
+权限」说明，新增绑定链判据（hidraw 数、`vr_system` 注册表、
+`bind RuntimeService` / `onBind` / `not Internal permitted` /
+`mManager == null` / `checkVRMode fail`），能区分「眼镜离线导致绑定从未发起」
+与「眼镜在位但 SDK 未触发绑定」。
