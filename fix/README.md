@@ -1100,6 +1100,8 @@ VR 桌面是 Unity 3D 场景，2D 应用不会因为「进程起来了」就自�
   `com.hvr.displayrouting` hook 放行；阶段 2 状态是「已构建安装、**待启用**」。
   实测设备 `/data/adb/lspd` 空、`pm list packages` 无 LSPosed、
   `/data/adb/modules/` 只有 `hvrglass` 与 `wadb` —— **模块至今没装、没启用**。
+  （这条只对「Runtime 建屏、桌面启动」的跨进程路径成立；11.13 的
+  panel-bootstrap 让启动方自己建屏，桌面自己拉起的应用不需要该模块。）
 
 **`overlay_display_devices` 的取舍**：反编译 `vrvirtualscreen` 的
 `HvrMirrorService.showMirror()` 确认，双目镜像屏尺寸按
@@ -1133,8 +1135,106 @@ sh fix/tools/vr-display-check.sh 192.168.43.133:5555
 ```
 
 分 A(Display 全景) / B(窗口归属) / C(overlay 与每眼推算) / D(路由日志) /
-E(LSPosed 模块) / F(USB 在位) 六段，直接给出缺哪一环。应急打开应用仍用
-`fix/tools/open-vr-app.sh`（11.11）。
+E(LSPosed 模块) / F(USB 在位) 六段（11.13 后增加 G 段启动时机），直接给出缺哪一环。
+应急打开应用仍用 `fix/tools/open-vr-app.sh`（11.11）。
 
 > 别混淆：`ACTION_GET_INTERNAL_INTERFACE` 那个 binder 缺口（11.10）是 **6DoF 位姿**，
 > 和这里的显示承载链是两条独立的线。
+
+### 11.13 接通 ①/②：进程启动预建「HUAWEI VR Display」（2026-11-08 第五轮）
+
+11.12 把 ② 缺失归因为「① 未被触发」，本轮定位到**具体原因并修好**，且证实
+**桌面自己拉起的应用不需要 LSPosed**。
+
+**两个硬伤**（都在 `HvrDisplayRouter.applyVrDisplay()` →
+`HvrVrPanelPresenter.start()` 这条唯一调用链上）：
+
+1. `applyVrDisplay()` 先取 `ContextEx.currentApplication()`，取不到就走
+   `if (context != null && start(context))` 短路。现场
+   `HvrServiceManagerEx: no application context` 证明该值确实可能为 null；
+   这正好解释 11.12 里「`HvrVrPanel` 日志全库 0 条」—— `start()` **一次都没被调用**
+   （它是唯一完全不打日志的返回路径）。
+2. 就算 `start()` 跑起来，`window.show()` 之后 `SurfaceView.surfaceCreated` 是
+   **异步**回调，同一次调用里 `HvrVrVirtualDisplay.displayId()` 必然还是 -1，
+   于是当次打印 `not up yet`、应用落到 `displayId=0`。而 `applyVrDisplay()`
+   只在桌面内部 `z0/c.B(Context, Class)` 打开页面时被调用（adb `am start`
+   根本不走这条路，与 11.11 的 `launchApp=0` 一致）——用户每点一次图标都在
+   「第一次」，永远等不到第二次。
+
+**修法**：把建屏时机前移到进程启动。
+`fix/patches/vrdesktop/fix_panel_bootstrap.py` 只改 launcherx 的
+`classes4.dex` 里 `HvrContextProvider.onCreate()`，在平台保证非 null 的
+`getContext()` 上，对 **com.huawei.vrlauncherx 进程**补一次
+`HvrVrPanelPresenter.start(context)`：
+
+```text
+provider onCreate → Presentation.show() → surfaceCreated (异步)
+  → HvrVrVirtualDisplay.ensure() → HUAWEI VR Display 3200x1600
+  → 之后任意一次 applyVrDisplay() 读 displayId() 都 >= 0 → setLaunchDisplayId 生效
+```
+
+屏由**启动方自己**创建（owner uid 与 `setLaunchDisplayId` 调用方相同），
+`isCallerAllowedToLaunchOnDisplay` 直接放行，因此绕开了 11.12 第 3 条
+「必须装 LSPosed」的前提。LSPosed 模块只对「Runtime 建屏、别的进程启动」
+的跨进程场景才是必需的。
+
+**部署**（一键脚本从设备当前 APK 拉底本，保留 glass-grace 等既有补丁，
+幂等、重签后 `pm install -r`；原包自动备份）：
+
+```sh
+sh fix/patches/vrdesktop/apply_panel_bootstrap.sh 192.168.43.133:5555
+```
+
+**真机验收**（补丁安装后进程稳定那一次，完整跑通 ①+②）：
+
+```text
+I HvrVrPanel : panel presentation shown on display 1 (Overlay #1)
+I HvrPanelBoot: panel presenter bootstrapped at provider onCreate
+I HvrVrPanel : panel surface created
+I HvrVrDisplay: HUAWEI VR Display created: displayId=4 3200x1600
+
+dumpsys display:
+  DisplayDeviceInfo{"HUAWEI VR Display": 3200x1600, 320dpi,
+    state ON, type VIRTUAL, owner com.huawei.vrlauncherx (uid 10074),
+    FLAG_PRESENTATION, FLAG_OWN_CONTENT_ONLY}
+dumpsys window displays: Display: mDisplayId=4 stacks=0
+```
+
+**边界（本轮无法做视觉验收）**：取证时眼镜物理离线（`hidraw=0`、
+`/dev/hwvr1` 不存在、`vr_system_state=null`），`VrMonitor.checkVRMode` 每约
+4.3 秒杀一次桌面（pid 24612→24709→…→25080）。此时每次 provider onCreate
+都能成功 `show()`，但进程活不到 `surfaceCreated`，虚拟屏建不起来。
+这是**既有闪退链**，不是本补丁缺陷：插回眼镜、桌面进程稳定后即自动恢复。
+手动 `touch /dev/hwvr1` 做 A/B 也稳不住（`isVRGlassDevExist` 仍 false，
+说明 `VrMonitor` 还有别的判据），实验后已删除该临时节点。
+
+**副屏尺寸职责分离**（11.12 第 2 条）：新增只读/可回滚的档位脚本，
+不默认改设备：
+
+```sh
+sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 show     # 现状 + 每眼推算
+sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 panel    # 1920x1080/320 → 每眼 608x1080
+sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 dual     # 100x100 + 1920x1080 两块
+sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 restore  # 回滚（修改前自动备份）
+```
+
+`100x100/320` → 每眼 50×28，SBS 面板是空壳；调大可能重新引入第九章的左眼
+叠影，所以两者是取舍。`dual` 目前只分离出两块屏，**尚未**让大屏被选中：
+`VrPlatformCompat.externalDisplay()` 和 `HvrMirrorService` 的
+`HvrPanelFinder` 都取第一块非默认 display，需要另 patch 按面积优先。
+改 overlay 会触发 DisplayManager 重建副屏 → Presentation dismiss → 虚拟屏
+释放，需重启 VR 桌面让 panel-bootstrap 重建。
+
+`vr-display-check.sh` 同步增强：A 段改为精确统计 `DisplayDeviceInfo` 行
+（旧写法把 1 块数成 5 块）并打印 owner；新增 G 段统计
+`HvrPanelBoot` / `shown` / `surface created` / `created` / `checkVRMode fail`，
+结论速查能区分「补丁没装」「补丁已装但眼镜离线」「补丁已装且眼镜在位却仍失败」。
+
+**仍需现场配合的剩余项**：
+
+1. 插回眼镜，用手柄在桌面里实点一个图标，抓
+   `HvrDisplayRouter: vr activity routed to display N` 并确认应用
+   `mDisplayId != 0`——这是 ③ 的最终视觉验收（adb `am start` 触发不了 `B()`）。
+2. 若要让 `dual` 生效，patch `externalDisplay()` / `HvrPanelFinder` 按面积选大屏。
+3. 跨进程（Runtime 建屏）路径仍需按 `docs/PROJECT_STATUS.md` 第 9 条启用
+   LSPosed 模块；该操作涉及刷框架组件 + 重启，**未执行**，需用户确认。
