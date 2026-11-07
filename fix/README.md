@@ -1065,3 +1065,76 @@ sh fix/tools/open-vr-app.sh   192.168.43.133:5555 alvr       # 不依赖手柄�
 脚本用 `cmd package resolve-activity --brief` 动态解析。别名：
 `desktop / alvr / market / cast / himovie / youku`。
 USB 重枚举瞬态会让 6DoF 探测读数为空，脚本自动隔 3 秒复采一次。
+
+### 11.12 「VR 桌面里打开应用，怎么没在桌面里显示」——显示承载链（2026-11-08 傍晚）
+
+**和 11.10 的输入链、前几章的启动/闪退链都不同**：这里应用进程、Activity
+全部正常（`am start` 下 ALVR / 应用市场 / 华为视频 / 投屏都 `Status: ok`
+并驻留），只是**画面没有出现在眼镜里的 VR 桌面 3D 空间**。
+
+VR 桌面是 Unity 3D 场景，2D 应用不会因为「进程起来了」就自动显示。移植版
+复刻的是 EMUI 原厂三段式显示链（设计见 `docs/PROJECT_STATUS.md` 第 8/9 条、
+`docs/PATCH_AUDIT.md` 65.3，代码在 `shared/java/com/huawei/vrframework/compat/`）：
+
+| 环 | 实现 | 作用 |
+|---|---|---|
+| ① | `HvrVrPanelPresenter.start()` | 在 `VrPlatformCompat.externalDisplay()` 找到的副屏上起 `Presentation` + 全屏 `SurfaceView` |
+| ② | `HvrVrVirtualDisplay.ensure()` | `surfaceCreated` 时建 **3200×1600** 的 `HUAWEI VR Display` 虚拟屏，输出到 ① 的 Surface |
+| ③ | `HvrDisplayRouter.applyVrDisplay()` | 启动应用时 `ActivityOptions.setLaunchDisplayId(vrDisplayId)`，把 Activity 路由到 ②；画面合成进 Presentation → 出现在眼镜里 |
+
+**现场三处断点（2026-11-08 18:35 实测）**：
+
+- ② 缺失：`dumpsys display` 只有 0 内置屏 1920×1080、1 `Overlay #1` 100×100、
+  2/3 `HW-VR-Cast-0/1` 各 **50×28**；**`HUAWEI VR Display` 计数 = 0**。
+  历史日志每次打开应用都伴随
+  `HvrDisplayRouter: HUAWEI VR Display not up yet, keeping the original launch options`
+  （`analysis-1108-openapp.log` 03:27:33、`-crash-onenter.log` 03:36:50、
+  `-recheck-1719.log` 04:19:38），即 ③ 每次都放弃路由。
+  `HvrVrPanel` 日志全库 0 条 → ① 的 Presentation 从未成功挂上。
+- 应用窗口全在 `displayId=0`（`dumpsys window displays`：`Display: mDisplayId=0 stacks=3`，
+  2/3 都是 `stacks=0`；SurfaceFlinger layer 的 `Root#0` 含 mboxlauncher / ALVR /
+  appmarket）。没有可路由的目标，也没有任何窗口被放进 VR 面板。
+- ③ 的平台权限前置也没做：`docs/PROJECT_STATUS.md` 第 9 条已记录，普通应用建的
+  虚拟屏 `isTrusted()=false`，跨应用 `setLaunchDisplayId` 会被
+  `isCallerAllowedToLaunchOnDisplay` 拒，必须靠 LSPosed 模块
+  `com.hvr.displayrouting` hook 放行；阶段 2 状态是「已构建安装、**待启用**」。
+  实测设备 `/data/adb/lspd` 空、`pm list packages` 无 LSPosed、
+  `/data/adb/modules/` 只有 `hvrglass` 与 `wadb` —— **模块至今没装、没启用**。
+
+**`overlay_display_devices` 的取舍**：反编译 `vrvirtualscreen` 的
+`HvrMirrorService.showMirror()` 确认，双目镜像屏尺寸按
+`scale = min((副屏宽/2)/1920, 副屏高/1080)`、`eye = round(主屏尺寸 × scale)`
+从副屏推导。当前 `100x100/320` → 每眼 **50×28**，与实测完全吻合，历史日志
+`mirror overlay shown on display 1 (Overlay #1) 100x100, eye 50x28` 也是这个值。
+手册 7.4 的成功态是 `1920x1080/320` + 608×1080 双目虚拟屏。
+100×100 是第九章为了消除左眼叠影特地压小的（辅助屏是主屏缩小镜像、会递归叠影），
+**副作用就是把 SBS 投屏面板一起压成空壳**。两个目标冲突，需二选一或分离职责
+（小屏只做在位判据、另建独立大屏做面板）。
+
+**修复顺序**（本轮只做诊断，未动设备设置 / 未装框架级组件）：
+
+1. 让 ① 跑起来：确认 `ContextEx.currentApplication()` 非 null、
+   `externalDisplay()` 能找到副屏；给 `HvrVrPanelPresenter.start()` 一个
+   可靠的启动时机（当前只在 `applyVrDisplay()` 里被动触发）。
+2. 把 `overlay_display_devices` 调大或分离出独立面板副屏，让 ② 有可用尺寸。
+3. 安装并启用 `lsposed/out/com.hvr.displayrouting-r2.apk`，作用域勾
+   「系统框架(android)」+ 七个包，重启；用
+   `lsposed/verify-display-routing.ps1` 验收。判据见 `docs/PROJECT_STATUS.md` 第 8 节：
+   `dumpsys display` 有 `HUAWEI VR Display 3200x1600`、
+   `dumpsys window` 里眼镜 display 上有 `ty=PRESENTATION` 窗口、
+   日志出现 `vr activity routed to display N`。
+4. 眼镜 USB 必须在位（本轮取证时整条下游掉线：`hidraw=0`、
+   `vr_system_state=null`，只剩 4 个 root hub）。
+
+只读体检：
+
+```sh
+sh fix/tools/vr-display-check.sh 192.168.43.133:5555
+```
+
+分 A(Display 全景) / B(窗口归属) / C(overlay 与每眼推算) / D(路由日志) /
+E(LSPosed 模块) / F(USB 在位) 六段，直接给出缺哪一环。应急打开应用仍用
+`fix/tools/open-vr-app.sh`（11.11）。
+
+> 别混淆：`ACTION_GET_INTERNAL_INTERFACE` 那个 binder 缺口（11.10）是 **6DoF 位姿**，
+> 和这里的显示承载链是两条独立的线。
