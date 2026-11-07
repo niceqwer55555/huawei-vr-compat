@@ -447,3 +447,36 @@ $env:PATH = 'C:\Users\555\.workbuddy\binaries\python\versions\3.13.12;' + $env:P
 | `HDMI黑屏-EDID修复.md` | 黑屏根因与修复 |
 | `线缆固件OTA-能不能骗.md` | OTA 协议逆向，结论：服务端已空 |
 | `6DoF-为什么没起来.md` | 6DoF 软件栈分析 |
+
+## 七、横屏方向补丁（VR 桌面不再显示成双目小窗）
+
+`VrSystemActor.lockLandscape()` 是给**手机原生竖屏**写的，无条件写
+`USER_ROTATION=ROTATION_90(1)`。RK3566 盒子原生 `1920x1080` 横屏，再转 90°
+变成 `1080x1920` 竖屏，而 HWC 物理输出是 `3200x1600` 横屏 —— VR 桌面被
+letterbox 压成中央小窗 + 上下大黑边。
+
+纯 settings 改不回来：`lockLandscape()` 会持续写回 1，守护拉锯会让 Unity
+黑屏。必须改 dex：
+
+```sh
+sh fix/patches/vrdesktop/apply_landscape_patch.sh [serial]
+```
+
+脚本会把设备当前 `com.huawei.hvrsdkserverapp` APK 拉下来，在 `classes4.dex`
+的 `lockLandscape()` 里把 `const/4 v4, 0x1` 改成 `0x0`（字节码 `12 14` →
+`12 04`，**只改 1 个字节** + 重算 DEX SHA1/Adler32），其余 404 个 APK 条目
+逐字节不变，用同一 debug 密钥重签后 `pm install -r` 覆盖。
+
+**实测结果（2026-11-07）**：`USER_ROT` 稳定为 0（框架自己写，无守护拉锯）、
+日志 `VrSystemActor: display locked to landscape`、主屏 `real 1920 x 1080`
+横屏、`clk[412180]` 不变、无 FATAL/ANR；眼镜里的左右眼画面由「竖屏中央
+小窗」变成**横向铺满全屏**。
+
+依赖 `python3`、`zipalign`、`apksigner.jar` 和一个 JRE（`apksigner` 需要 java；
+本机可下载 Temurin JRE 17 解压到 `build/tmp/jre17/`，或用 `JAVA` 环境变量
+指定）。路径可用 `ADB` / `JAVA` / `BUILD_TOOLS` 覆盖。原 APK 存在
+`build/tmp/landscape/base.apk`，`adb install -r` 它即可回退。
+
+> 注意：眼镜 USB 设备（`12d1:1092` / `12d1:107e`）掉线时
+> `glass probe: usb=false`，VR 会话会判定眼镜不在位而退回桌面。这是物理层
+> 问题，需要重新插拔眼镜 USB/电源，不是本补丁的回归。
