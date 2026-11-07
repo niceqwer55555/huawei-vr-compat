@@ -34,7 +34,8 @@
 set -eu
 
 SERIAL="${1:-192.168.43.133:5555}"
-ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+# 必须用盘符风格（pwd -W）：Windows 原生 python/java 不认 MSYS 的 /f/... 路径。
+ROOT=$(cd "$(dirname "$0")/../../.." && (pwd -W 2>/dev/null || pwd))
 OUT="$ROOT/build/tmp/landscape"
 PATCHDIR="$ROOT/fix/patches/vrdesktop"
 KEYSTORE="$ROOT/fix/signing/hvr-compat-debug.jks"
@@ -63,7 +64,8 @@ JAVA=$(find_java) || {
     echo "[FATAL] 找不到 java（apksigner 需要）。可下载 Temurin JRE 17 解压到"
     echo "        build/tmp/jre17/ 或设置 JAVA=/path/to/java.exe"; exit 1; }
 
-BT="${BUILD_TOOLS:-/d/Tools/AndroidSDK/build-tools/34.0.0}"
+# 同样用盘符风格：apksigner.jar 的路径要交给 Windows java.exe。
+BT="${BUILD_TOOLS:-D:/Tools/AndroidSDK/build-tools/34.0.0}"
 [ -x "$BT/zipalign.exe" ] || { echo "[FATAL] zipalign 不存在：$BT"; exit 1; }
 [ -f "$BT/lib/apksigner.jar" ] || { echo "[FATAL] apksigner.jar 不存在：$BT"; exit 1; }
 [ -f "$KEYSTORE" ] || { echo "[FATAL] 签名密钥不存在：$KEYSTORE"; exit 1; }

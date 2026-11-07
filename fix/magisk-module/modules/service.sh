@@ -28,7 +28,12 @@ echo "$(date) service.sh 启动" >> "$LOG"
     export PATH=/system/bin:/system/xbin:$PATH
     am start-service -n com.huawei.vrservice/com.huawei.vrservice.VRService 2>/dev/null
     am start-service -n com.huawei.hvrsdkserverapp/com.huawei.hvrsdkserverapp.service.ArvrRuntimeService 2>/dev/null
-    echo "$(date) 已请求拉起 VRService + ArvrRuntimeService" >> "$LOG"
+    # 手柄自动扫描（2026-11-07）：VRHandleService 没有开机广播，平时靠
+    # VrSystemActor 每 20 秒的 ACTION_RECONNECT_MSG 拉起。这里显式发一次，
+    # 让开机立即触发 AutoScanCompat 的 BLE 扫描，不用等首轮心跳。
+    # 注意它只是「加速」：即使被 Android 11 后台启动限制拦下，心跳也会拉起。
+    am start-foreground-service -n com.huawei.vrhandle/.service.VRHandleService -a com.huawei.vrservice.ACTION_RECONNECT_MSG 2>/dev/null
+    echo "$(date) 已请求拉起 VRService + ArvrRuntimeService + VRHandleService" >> "$LOG"
 ) &
 
 # --- 无线 adb 已移交独立 wadb 模块 ---

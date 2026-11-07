@@ -58,6 +58,20 @@ for p in com.huawei.vrlauncherx com.huawei.vrhandle com.huawei.vrvirtualscreen \
     set_op "$p" SYSTEM_ALERT_WINDOW
 done
 set_op com.huawei.vrlauncherx GET_USAGE_STATS
+# 手柄自动扫描（2026-11-07）：vrhandle 是后台 Service 发起 BLE 扫描，
+# Android 11 的「仅前台允许定位」会拦掉扫描结果，日志表现为
+#   E BluetoothUtils: Permission denial: Need ACCESS_FINE_LOCATION permission
+# 即使 pm 里 granted=true，appops 仍可能停在 foreground/有 rejectTime。
+# 三个 op 都要显式 allow —— 这是必要条件，但还不足够：
+#   cmd appops get --uid <uid> 显示 UID 级 COARSE_LOCATION: foreground，
+#   appops set / reset / --uid 都改不掉（系统按「仅在使用期间允许」动态给）。
+#   实测后台 Service 扫描会打权限拒绝、AppScanStats Total results=0；
+#   把 com.huawei.vrhandle/.MainActivity 拉到前台时拒绝消失。
+# 所以首次入库仍需要一次前台配对页；入库之后 20 秒重连心跳即可自动连接，
+# 不再需要扫描。详见 README 第九节。
+for op in android:fine_location android:coarse_location android:bluetooth_scan; do
+    set_op com.huawei.vrhandle "$op"
+done
 
 echo "== pm grant =="
 grant() {
@@ -67,6 +81,8 @@ grant com.huawei.vrlauncherx android.permission.WRITE_SECURE_SETTINGS
 grant com.huawei.vrlauncherx android.permission.READ_PHONE_STATE
 grant com.huawei.vrlauncherx android.permission.ACCESS_FINE_LOCATION
 grant com.huawei.vrlauncherx android.permission.ACCESS_COARSE_LOCATION
+grant com.huawei.vrhandle android.permission.ACCESS_FINE_LOCATION
+grant com.huawei.vrhandle android.permission.ACCESS_COARSE_LOCATION
 grant com.huawei.appmarket.vr android.permission.READ_PHONE_STATE
 grant com.huawei.vrservice android.permission.WRITE_SECURE_SETTINGS
 

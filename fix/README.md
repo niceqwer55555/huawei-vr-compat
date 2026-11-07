@@ -528,3 +528,116 @@ VR 会话保持，窗口缩到几乎不可见，左右眼双目画面完整对�
 > 排障口诀：眼镜全黑 → 查 `/dev/hwvr1` 指向和 `active device(2) OK`；
 > 左眼有叠影 → 查 `settings get global overlay_display_devices`；
 > 主屏截图不等于眼镜面板输出，辅助屏那一路 `screencap -d <id>` 截不到。
+
+## 九、手柄开机自动扫描补丁（2026-11-07）
+
+### 9.1 原厂链路缺什么
+
+`VRHandleService` 只处理 4 个 action（两个 `ACTION_RECONNECT_MSG`、
+两个眼镜戴上/摘下），**没有任何扫描入口**。日志每 20 秒一次：
+
+```
+VrSystemActor: handle reconnect requested -> ...VRHandleService
+VrSdkApi: enter getUsedDeviceList, mDeviceInfoList size = 0
+ReconnectController: not connected to any device, skip
+```
+
+扫描逻辑全在配对页 `ScanningFragment`（UI）里。实测发
+`ACTION_GLASS_AWAY_TO_NEAR` 也不会触发扫描（`Discovering: false`）。
+盒子上 `shared_prefs` 空、`Bonded devices` 空 → 手柄从未入库，
+「自动连接」无对象可连。项目里的自研 `shell/ControllerLink` 没编译、
+设备上没装，所以只剩改 APK 这一条路。
+
+### 9.2 补丁做了什么
+
+新增 `AutoScanCompat`（smali），由 `VRHandleService.onCreate` /
+`onStartCommand` 各调用一次 `kick()`：
+
+- 用 vrhandle 自带的 BLE 扫描管理器 `t0/y0`（`R()` 自初始化单例），
+  把 Service 已有的 `m` 字段（`VRHandleService$d` implements
+  `BluetoothDeviceDiscoverCallback`）传给 `N(Lp0/c)` 启动扫描；
+- 扫到设备后**原厂链路**走 `N2(BluetoothDevice)` 入库并连接，不需要配对页 UI；
+- **60 秒节流**：冷启动安排一次，之后 20 秒心跳每次检查，手柄晚开机 /
+  休眠唤醒后下一轮自动被扫到；
+- **延迟 3 秒**（`Handler.postDelayed`）：扫描必须晚于 `startForeground()`。
+  直接扫的日志顺序是 `onScannerRegistered → Permission denial →
+  show common foreground notification`，蓝牙栈把调用者判成后台；
+- 全程 `try/catch`，任何异常都静默跳过，不影响 Service 原有流程。
+
+只新增 1 个类 + 2 行调用，其余 863 个 APK 条目逐字节不变，
+同密钥 v1/v2 重签，`pm install -r` 直接覆盖。
+
+### 9.3 一键工具
+
+```sh
+sh fix/patches/vrdesktop/apply_autoscan_patch.sh 192.168.43.133:5555
+```
+
+自动完成：拉原包 → baksmali → 注入 → smali 回编译 → 替换 dex →
+zipalign → apksigner v1/v2 → 证书一致性校验 → 安装 → 补授权 → 冷启动验收。
+需要 JRE 17（可放 `build/tmp/jre17/`）、`tools/{baksmali,smali}-fat.jar`、
+Android build-tools 34。设备上已是补丁版时，用
+`BASE_APK=<未打补丁的原包> sh ...` 指定干净底本，回退镜像才可靠。
+
+回退：`adb install -r build/tmp/autoscan/base.apk`。
+
+### 9.4 开机链路
+
+`magisk-module/modules/service.sh` 在 `boot_completed` 后拉起
+`ArvrRuntimeService`，并在同一块里显式发一次 `ACTION_RECONNECT_MSG`
+让开机立即扫（不用等首轮 20 秒心跳）；`install.sh` 的两处补拉也同步加了。
+`grant-vr-perms.sh` 补三个定位/扫描 appops 与 `deviceidle` 白名单。
+
+### 9.5 ⚠️ 系统硬限制：后台 Service 扫描拿不到结果
+
+这是本轮最重要的结论，**不要据此声称「已能自动连接」**：
+
+```
+E BluetoothUtils: Permission denial: Need ACCESS_FINE_LOCATION permission to get scan results
+dumpsys bluetooth_manager → com.huawei.vrhandle
+    LE scans (started/stopped): 48 / 48
+    Total number of results   : 0        ← 扫了 48 次，一个结果都没有
+```
+
+`pm` 里 `ACCESS_FINE_LOCATION granted=true`、`location_mode=3`、
+package 级 `appops` 全部 `allow`，但 `cmd appops get --uid 10075`
+显示 **UID 级 `COARSE_LOCATION: foreground`** —— 系统按「仅在使用期间允许」
+动态给出，`appops set` / `reset` / `--uid` 都改不掉（shell 的 MODE 只有
+allow/ignore/deny/default，没有 foreground）。
+
+实测对照：
+
+| 场景 | `Permission denial` | 扫描结果 |
+|---|---|---|
+| 后台 Service（含前台服务 + 延迟 3 秒） | 每次扫描 1 条 | 0 |
+| `am start -n com.huawei.vrhandle/.MainActivity`（可见 Activity） | **0 条** | 0（当时手柄未在广播） |
+
+即：**需要可见 Activity 级前台**才能通过定位检查。前台服务不够。
+另外手柄 CF20 静置会休眠、或已连到别的设备，此时附近没有 BLE 广播，
+`Total number of results` 同样是 0 —— 两个条件要同时满足。
+
+**当前可行的完整路径**：首次让 `com.huawei.vrhandle/.MainActivity`
+在前台完成一次扫描入库（之后 `mDeviceInfoList size` 变 1、
+`shared_prefs` 写入 MAC）；**入库之后每次开机**走原有 20 秒重连心跳即可
+自动连接，不再需要扫描、不再需要 UI。是否把「开机自动拉起一次前台配对页」
+写进工具，需要用户确认（会短暂在眼镜里显示 2D 配对界面）。
+
+### 9.6 验收命令
+
+```sh
+# 补丁在跑
+adb shell logcat -d | grep AutoScanCompat
+#   kick: schedule BLE scan after foreground +3s
+#   run: auto BLE scan (foreground ready)
+adb shell logcat -d | grep VrDeviceManager      # enter discover / startScan
+
+# 是否真拿到结果（比日志更可靠）
+adb shell dumpsys bluetooth_manager | grep -A8 com.huawei.vrhandle
+#   看 Total number of results / Last 5 scans
+
+# 是否已入库并连接
+adb shell logcat -d | grep -E 'mDeviceInfoList size|CF20|connectGatt'
+adb shell dumpsys bluetooth_manager | grep -i 'Bonded devices'
+```
+
+手柄没广播时按一下电源键唤醒、别让它连着别的设备，下一轮 60 秒内会自动扫到。

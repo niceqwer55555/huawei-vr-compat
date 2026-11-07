@@ -406,7 +406,7 @@ root_ "rm -f /data/adb/modules/hvrglass/disable" >/dev/null 2>&1
 echo "  hvrglass 模块 = $(sh_ 'test -f /data/adb/modules/hvrglass/disable && echo DISABLED || echo enabled')"
 root_ "resetprop ro.product.manufacturer HUAWEI; resetprop ro.vr.surport true" >/dev/null 2>&1
 echo "  ro.vr.surport = $(sh_ 'getprop ro.vr.surport')"
-root_ "am start-service -n com.huawei.vrservice/com.huawei.vrservice.VRService; am start-service -n com.huawei.hvrsdkserverapp/com.huawei.hvrsdkserverapp.service.ArvrRuntimeService" >/dev/null 2>&1
+root_ "am start-service -n com.huawei.vrservice/com.huawei.vrservice.VRService; am start-service -n com.huawei.hvrsdkserverapp/com.huawei.hvrsdkserverapp.service.ArvrRuntimeService; am start-foreground-service -n com.huawei.vrhandle/.service.VRHandleService -a com.huawei.vrservice.ACTION_RECONNECT_MSG" >/dev/null 2>&1
 echo "  VR 服务进程："
 sh_ "ps -A | grep -E 'vrservice|ArvrRuntimeService' | grep -v grep" | sed 's/^/    /' || \
     echo "    （未起，检查 deviceidle 白名单是否含 vrservice / hvrsdkserverapp）"
@@ -434,7 +434,7 @@ if [ "$LIGHT_ON" = "1" ]; then
         # （2026-11-07 实测：装完只剩 7/7 启动的应用市场，6/7 进程为空）。
         # 点亮完成后补拉一次，保证安装结束时 VR 栈是活的。
         echo "  [i] 点亮后补拉 VR 服务（SF 重启会冲掉 4/7 拉起的进程）..."
-        root_ "am start-service -n com.huawei.vrservice/com.huawei.vrservice.VRService; am start-service -n com.huawei.hvrsdkserverapp/com.huawei.hvrsdkserverapp.service.ArvrRuntimeService" >/dev/null 2>&1
+        root_ "am start-service -n com.huawei.vrservice/com.huawei.vrservice.VRService; am start-service -n com.huawei.hvrsdkserverapp/com.huawei.hvrsdkserverapp.service.ArvrRuntimeService; am start-foreground-service -n com.huawei.vrhandle/.service.VRHandleService -a com.huawei.vrservice.ACTION_RECONNECT_MSG" >/dev/null 2>&1
         sleep 3
     else
         echo "  [WARN] 90 秒内无线 ADB 未恢复，下面验收可能为空。"
