@@ -716,3 +716,10 @@ adb shell logcat -d | grep -E 'buffer type: PROXIMITY|Helmet Up|Helmet down'
 # 桌面自动拉起记录
 adb shell su -c 'grep 拉起 /data/local/tmp/hidraw_perm.log'
 ```
+
+**⚠️ light-on 之后眼镜黑屏、无画面（2026-11-08）**：`light-on.sh` 会
+`stop/start surfaceflinger`，SF 重启会把**已运行** launcher 的 Unity
+SurfaceView 缓冲队列打废（logcat 每帧 `requestBuffer failed BAD_VALUE`），
+眼镜面板 ACTIVE 但全黑。修法：点亮后 `am force-stop com.huawei.vrlauncherx`
+再 `am start`，Unity 重建 surface 即恢复（实测闭环）。所以正确顺序是
+**先点亮、再（重）启桌面**——守护脚本的自动拉起已天然满足（开机顺序）。
