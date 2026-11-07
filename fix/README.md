@@ -655,3 +655,64 @@ adb shell su -c 'cat /data/data/com.huawei.vrhandle/shared_prefs/sp_device_stora
 手柄没广播时按一下电源键唤醒、别让它连着别的设备，下一轮 60 秒内会自动扫到。
 回退：`adb install -r build/tmp/autoscan/base.apk`（回退后删掉
 `shared_prefs/sp_device_storage.xml` 即完全恢复原厂行为）。
+
+## 十、佩戴感应黑屏/亮屏 + 跳过 OOBE + 插眼镜自动进桌面（2026-11-08）
+
+三个体验补丁，一次搞定：
+
+### 10.1 佩戴感应（遮挡传感器 → 黑屏/亮屏）
+
+**根因**：vrservice 的 `VRDeviceNodeMonitor`（读 `/dev/ttyUSB1` vcom 通道，
+解析 PROXIMITY/HEADSET/BATTERY 缓冲帧）在 `onCreate` 里创建后**从不
+start()**。原厂靠 `startHelmetMonitor()` 启动它，而那条链要求
+`isVRHelmetConnectJNI()` 的 HID 初始化时序，本机永不触发 → 遮挡事件全断。
+
+**修法**：`VRService.onCreate` 里 `iput-object mDeviceNodeMonitor` 之后补
+`invoke-interface {v0}, Lcom/huawei/vrservice/monitor/VRMonitor;->start()V`
+（start 有 mMonitorStarted 幂等保护，与 startHelmetMonitor 并存无害）。
+
+- 一键工具：`patches/vrdesktop/apply_monitor_patch.sh`（拉包→baksmali→
+  `inject_monitor_start.py` 注入→smali→replace_dex→zipalign→apksigner
+  →安装→归档 `apks/com.huawei.vrservice.apk`）。
+- 已知现象（不影响功能）：
+  - `init proximity` 报 `get glass proximity fail!`：开机首读失败，
+    传感器值变化时走 vcom 帧正常上报；
+  - `BATTERY value: 0 → battery is below 5`：IoGetBatteryStatus 对本机
+    走 Broken pipe，电量恒 0 触发的误告警，VR 不会被关。
+- HWC 老毛病不变：**重启后眼镜面板不自动亮**，仍需手工
+  `sh fix/light-on.sh`（不要把点亮写进开机脚本，手册第六章有血的教训）。
+
+### 10.2 跳过手柄设置弹窗（OOBE），直达主页
+
+OOBE 场景（`OOBESimpleScene`，3DoF 内嵌 Unity 场景）由 Unity PlayerPrefs
+控制，免改 APK：
+
+```
+needShowOOBE / needShowPhoneOOBE / needShowNoloOOBE = 0
+```
+
+写在 `/data/data/com.huawei.vrlauncherx/shared_prefs/
+com.huawei.vrlauncherx.v2.playerprefs.xml`。**必须先 force-stop 再改**，
+Unity 退出时会用内存值覆盖 XML。install.sh 第 3 步已自动写入。
+决策链（反编译 Assembly-CSharp.dll）：`WalleXSceneManager.NeedShowOobe()`
+读 `needShowOOBE`（默认 1）→ TryToChangeScene 跳过 OOBESimpleScene 直达
+HomeScene。想恢复引导改回 1 即可。
+
+### 10.3 插入眼镜自动启动桌面
+
+`magisk-module/modules/service.sh` 主循环里加状态机：控制接口（描述符
+`06 ff 00`）从不在位变在位 → 稳定 8 秒且 VRService 已在跑 → `am start`
+一次 `com.huawei.vrlauncherx/.MainActivity`；拔出复位，重插再拉。
+开机时眼镜已插着也覆盖。日志在 `/data/local/tmp/hidraw_perm.log`
+（"眼镜在位 → 已拉起 VR 桌面"）。
+
+### 10.4 验收
+
+```sh
+# monitor 在跑（读线程持有 ttyUSB1）
+adb shell su -c 'ls -l /proc/$(pidof -s com.huawei.vrservice)/fd | grep ttyUSB1'
+# 遮挡事件（戴上/摘下眼镜时）
+adb shell logcat -d | grep -E 'buffer type: PROXIMITY|Helmet Up|Helmet down'
+# 桌面自动拉起记录
+adb shell su -c 'grep 拉起 /data/local/tmp/hidraw_perm.log'
+```

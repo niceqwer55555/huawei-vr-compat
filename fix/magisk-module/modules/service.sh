@@ -56,6 +56,14 @@ echo "$(date) service.sh 启动" >> "$LOG"
 # 不改变既有行为。详见 fix/ttyusb-compat.sh 头部说明。
 TTYUSB_REGISTERED=0
 
+# --- 眼镜插入自动拉起 VR 桌面（2026-11-08）---
+# 状态机：眼镜从「不在位」变「在位」（CTRL 探测到控制接口）后，
+# 稳定 8 秒且 VRService 已在跑，就 am start 一次 VR 桌面；拔出后复位，
+# 下次插入再拉。开机时眼镜已插着的场景也由这里覆盖（服务起来后首轮探测）。
+GLASS_WAS=0
+GLASS_SEEN=0
+GLASS_LAUNCH_DONE=0
+
 while true; do
     for h in /dev/hidraw*; do
         [ -e "$h" ] || continue
@@ -116,12 +124,32 @@ while true; do
             ln -s "$CTRL" /dev/hwvr1 2>/dev/null && \
                 echo "$(date) hwvr1 -> $CTRL (control iface)" >> "$LOG"
         fi
+        # --- 眼镜插入自动拉起 VR 桌面（2026-11-08）---
+        # 等 8 秒是给 USB 枚举 + 显示通路稳定；要求 VRService 已在跑，
+        # 否则桌面起来也进不了 VR 模式，眼镜黑屏。
+        T=$(date +%s)
+        if [ "$GLASS_WAS" != "1" ]; then
+            GLASS_SEEN=$T
+        fi
+        if [ "$GLASS_LAUNCH_DONE" != "1" ] && [ $((T - GLASS_SEEN)) -ge 8 ] \
+           && [ -n "$(pidof com.huawei.vrservice 2>/dev/null)" ]; then
+            if am start -n com.huawei.vrlauncherx/.MainActivity >/dev/null 2>&1; then
+                GLASS_LAUNCH_DONE=1
+                echo "$(date) 眼镜在位 → 已拉起 VR 桌面" >> "$LOG"
+            fi
+        fi
+        GLASS_WAS=1
     else
         # 眼镜拔出：摘掉死链，等插回再建
         if [ -L /dev/hwvr1 ]; then
             rm -f /dev/hwvr1
             echo "$(date) hwvr1 清除（控制接口不在位）" >> "$LOG"
         fi
+        if [ "$GLASS_WAS" = "1" ]; then
+            echo "$(date) 眼镜拔出，重插时将自动拉起 VR 桌面" >> "$LOG"
+        fi
+        GLASS_WAS=0
+        GLASS_LAUNCH_DONE=0
     fi
 
     # --- /dev/ttyUSB* vcom 节点（2026-11-06 新增，受开关控制）---

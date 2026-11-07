@@ -378,6 +378,19 @@ step "3/7 绕过 launcherx 隐私页（Android 11 禁写 Settings.System 自定�
 root_ "settings put system PRIVACY_ACCEPTED 1" >/dev/null 2>&1
 echo "  PRIVACY_ACCEPTED = $(sh_ 'settings get system PRIVACY_ACCEPTED')"
 
+# 跳过手柄设置弹窗（OOBE），进桌面直达主页。OOBE 场景由 Unity PlayerPrefs
+# needShowOOBE / needShowPhoneOOBE / needShowNoloOOBE 控制（默认 1=显示），
+# WalleXSceneManager.NeedShowOobe() 读它们决定是否进 OOBESimpleScene。
+# 注意：必须先 force-stop 再改文件，Unity 退出时会用内存值覆盖 XML。
+root_ "am force-stop com.huawei.vrlauncherx; sleep 1
+F=/data/data/com.huawei.vrlauncherx/shared_prefs/com.huawei.vrlauncherx.v2.playerprefs.xml
+if [ -f \$F ] && ! grep -q needShowOOBE \$F; then
+  sed -i 's|</map>|    <int name=\"needShowOOBE\" value=\"0\" />\\n    <int name=\"needShowPhoneOOBE\" value=\"0\" />\\n    <int name=\"needShowNoloOOBE\" value=\"0\" />\\n</map>|' \$F
+  echo \"  needShowOOBE=0 已写入（OOBE 弹窗跳过）\"
+else
+  echo \"  OOBE 开关已存在或 prefs 缺失，跳过\"
+fi" 2>&1 | grep -v "^$" | tail -2
+
 # =============================================================================
 step "4/7 补授权（appops / pm grant / deviceidle / 日志级别）"
 sh "$HERE/tools/grant-vr-perms.sh" "$SERIAL" 2>/dev/null || \
