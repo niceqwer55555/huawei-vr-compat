@@ -383,6 +383,19 @@ step "4/7 补授权（appops / pm grant / deviceidle / 日志级别）"
 sh "$HERE/tools/grant-vr-perms.sh" "$SERIAL" 2>/dev/null || \
     echo "  [WARN] grant-vr-perms.sh 执行异常，可手动重跑"
 
+# --- 模拟辅助显示设备：VR 会话要 externalDisplay=true，但窗口不能挡左眼 ---
+# VrPlatformCompat.externalDisplay() 要求存在一块「非 DEFAULT_DISPLAY 且
+# STATE_ON」的屏。盒子只有一块 HDMI（被安卓当内置屏 display 0），所以靠
+# 开发者选项「模拟辅助显示设备」造一块辅助屏来满足在位判定。
+# 这块辅助屏会以系统窗口叠在主屏合成上，且窗口内容是主屏的缩小镜像，
+# 形成递归叠影；左眼正好落在主屏左半，就会看到错乱画面（2026-11-07
+# 用户实测「左眼不对、右眼对」）。反复改这个 setting 还会残留多个旧窗口。
+# 100x100/320 是实测能被创建的最小尺寸：判定仍为 true，窗口缩到几乎不可见，
+# 左右眼双目画面完整对称。
+# 回退：settings delete global overlay_display_devices（VR 会话会退出）。
+root_ "settings put global overlay_display_devices 100x100/320" >/dev/null 2>&1
+echo "  overlay_display_devices = $(sh_ 'settings get global overlay_display_devices')"
+
 # --- 恢复模块启用 + 平台伪装 + VR 服务链（都是历史实证的既有配置，非新增开机逻辑）---
 # ① rescue_boot.sh --disable-hvrglass 救砖后会留下 disable 标记。若不删，
 #    模块整套不跑：无 HUAWEI 伪装、无白名单 bind mount、无 hidraw 权限守护、

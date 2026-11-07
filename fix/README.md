@@ -480,3 +480,51 @@ sh fix/patches/vrdesktop/apply_landscape_patch.sh [serial]
 > 注意：眼镜 USB 设备（`12d1:1092` / `12d1:107e`）掉线时
 > `glass probe: usb=false`，VR 会话会判定眼镜不在位而退回桌面。这是物理层
 > 问题，需要重新插拔眼镜 USB/电源，不是本补丁的回归。
+
+## 八、眼镜面板激活与左右眼画面（2026-11-07 实测两处坑）
+
+### 8.1 hidraw 编号漂移 → `/dev/hwvr1` 指错接口 → 眼镜面板不亮
+
+`vrservice/WalleDev` 硬编码打开 `/dev/hwvr1`，激活命令
+`HIDIOCSFEATURE(5)` 必须发到**控制接口**才能点亮眼镜面板。眼镜 USB
+每次拔插都会重新枚举、hidraw 编号会变：
+
+| 时刻 | hidraw0 | hidraw1 | 描述符特征 |
+|---|---|---|---|
+| 拔插前 | `12d1:1092` CV10 | `12d1:107e` 控制口 | 控制口 `06 ff 00`（Vendor，report 1 = 59B IMU） |
+| 拔插后 | `12d1:107e` **控制口** | `12d1:107e` Consumer Control | 按键口 `05 0c` |
+
+旧逻辑把 `/dev/hwvr1` 写死指向 `hidraw1`，拔插后指到按键口，于是
+`DevHid: No Glass data` 723 次、`hidraw: passed too short report`、
+`active device(2) OK` 出不来 —— **HDMI 有时序但眼镜面板不亮**。
+现象就是「Android 主屏截图有 VR 画面，眼镜里却什么都没有」。
+
+`magisk-module/modules/service.sh` 现在按 **HID 报告描述符前 3 字节
+`06 ff 00`** 找控制接口并自动纠正 `/dev/hwvr1`（不依赖编号、不写死
+VID/PID）。实测故意指错后 1 秒内自动改回。
+注：`ksu/hwvr_compat/hwvr-probe` 的 `GET_FEATURE(4)` 在本机 hidraw0/1
+都返回 0，区分不了，所以用描述符。
+
+### 8.2 模拟辅助屏窗口叠影 → 左眼画面错乱
+
+`VrPlatformCompat.externalDisplay()` 要求存在一块非 `DEFAULT_DISPLAY`
+且 `STATE_ON` 的屏；盒子只有一块 HDMI（被安卓当内置屏），所以靠开发者
+选项「模拟辅助显示设备」造辅助屏来满足在位判定。但该辅助屏是叠在主屏
+合成里的系统窗口，内容是主屏的缩小镜像 → 递归叠影；**左眼正好落在
+主屏左半**，就出现「左眼不对、右眼对」。反复改这个 setting 还会残留
+多个旧窗口 layer，叠影越积越多。
+
+一键安装现在幂等写：
+
+```sh
+settings put global overlay_display_devices 100x100/320
+```
+
+`100x100/320` 是实测能创建的最小尺寸：`externalDisplay=true` 仍成立、
+VR 会话保持，窗口缩到几乎不可见，左右眼双目画面完整对称。
+完全关掉（`settings delete ...`）会让 `externalDisplay=false` → VR 会话
+判定眼镜不在位并退回桌面，**不要关**。
+
+> 排障口诀：眼镜全黑 → 查 `/dev/hwvr1` 指向和 `active device(2) OK`；
+> 左眼有叠影 → 查 `settings get global overlay_display_devices`；
+> 主屏截图不等于眼镜面板输出，辅助屏那一路 `screencap -d <id>` 截不到。

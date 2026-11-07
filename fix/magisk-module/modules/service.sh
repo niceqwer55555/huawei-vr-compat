@@ -82,20 +82,41 @@ while true; do
                 ;;
         esac
     done
-    # --- /dev/hwvr1 符号链接维护（2026-11-04） ---
-    # vrservice/WalleDev 硬编码打开 /dev/hwvr1；真机是华为内核 misc 设备，
-    # 通用内核没有。touch 假文件=打开成功但协议全废；symlink 到眼镜 HID
-    # （12d1:107e 的 hidraw）后 HIDIOCSFEATURE(report 5) 激活走通。
-    # 眼镜重枚举会换 hidraw 编号吗？本机固定 hidraw1/2=HID、hidraw0=CV10，
-    # 若编号变化按"最后一个非 hidraw0"处理也可，先保持实测有效的 hidraw1。
-    if [ -e /dev/hidraw1 ] && [ ! -L /dev/hwvr1 ]; then
-        rm -f /dev/hwvr1
-        ln -s /dev/hidraw1 /dev/hwvr1 2>/dev/null && \
-            echo "$(date) hwvr1 -> hidraw1" >> "$LOG"
-    elif [ -L /dev/hwvr1 ] && [ ! -e /dev/hidraw1 ]; then
-        # 眼镜拔出后 hidraw1 消失，摘掉死链，等插回再建
-        rm -f /dev/hwvr1
-        echo "$(date) hwvr1 死链清除（hidraw1 消失）" >> "$LOG"
+    # --- /dev/hwvr1 控制接口维护（2026-11-07 改为按描述符探测）---
+    # vrservice/WalleDev 硬编码打开 /dev/hwvr1；眼镜的 HIDIOCSFEATURE(5)
+    # 激活命令必须发到「控制接口」才能点亮面板。
+    #
+    # ⚠️ 不能写死 hidraw 编号：2026-11-07 实测用户拔插眼镜后 CV10 那个
+    # hidraw 消失，编号整体前移，真控制接口从 hidraw1 变成 hidraw0，
+    # 而 hidraw1 变成 Consumer Control 按键口。旧逻辑仍指向 hidraw1，
+    # 结果 DevHid "No Glass data" 723 次、hidraw "too short report"、
+    # 激活发不出、眼镜面板不亮（用户："眼镜里没有画面"）。
+    #
+    # 判据用 HID 报告描述符，不依赖编号也不写死 VID/PID：
+    #   控制接口 (12d1:107e input3) 以 `06 ff 00` 开头（Vendor Defined
+    #     Usage Page），report 1 是 59 字节 IMU、Feature id4 127 字节；
+    #   Consumer Control 按键口以 `05 0c` 开头，Hub 以 `05 01` 开头。
+    # 注：ksu/hwvr_compat/hwvr-probe 的 GET_FEATURE(4) 在本机 hidraw0/1
+    #     都返回 0，无法区分，所以这里用描述符。
+    CTRL=""
+    for h in /sys/class/hidraw/hidraw*; do
+        [ -e "$h" ] || continue
+        d=$(od -An -tx1 -N3 -v "$h/device/report_descriptor" 2>/dev/null | tr -d ' \n')
+        [ "$d" = "06ff00" ] && { CTRL="/dev/${h##*/}"; break; }
+    done
+    if [ -n "$CTRL" ]; then
+        CUR=$(readlink /dev/hwvr1 2>/dev/null)
+        if [ "$CUR" != "$CTRL" ]; then
+            rm -f /dev/hwvr1
+            ln -s "$CTRL" /dev/hwvr1 2>/dev/null && \
+                echo "$(date) hwvr1 -> $CTRL (control iface)" >> "$LOG"
+        fi
+    else
+        # 眼镜拔出：摘掉死链，等插回再建
+        if [ -L /dev/hwvr1 ]; then
+            rm -f /dev/hwvr1
+            echo "$(date) hwvr1 清除（控制接口不在位）" >> "$LOG"
+        fi
     fi
 
     # --- /dev/ttyUSB* vcom 节点（2026-11-06 新增，受开关控制）---
