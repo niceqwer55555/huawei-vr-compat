@@ -206,8 +206,8 @@ while true; do
         # 的闪退循环。连续 3 轮（约 9s）仍不在位才认定为真拔出。
         MISS=$((MISS + 1))
         if [ "$MISS" -ge 3 ]; then
-            # 眼镜拔出：摘掉死链，等插回再建
-            if [ -L /dev/hwvr1 ]; then
+            # 真拔出：清掉 symlink 或占位普通文件，让框架判据回到 false
+            if [ -e /dev/hwvr1 ] || [ -L /dev/hwvr1 ]; then
                 rm -f /dev/hwvr1
                 echo "$(date) hwvr1 清除（控制接口不在位）" >> "$LOG"
             fi
@@ -217,6 +217,20 @@ while true; do
             GLASS_WAS=0
             GLASS_LAUNCH_DONE=0
             STATE_RETRY=0
+        else
+            # 瞬态窗口（2026-11-08 第四轮）：断链 symlink 的 File.exists()
+            # 是 false。框架侧 VrMonitor.isVRGlassDevExist()（原版实现）和
+            # VrPlatformCompat.hasGlassUsbIdentity()（glass-grace 回退判据）
+            # 都看 /dev/hwvr1 是否存在，一断链就判「眼镜不在」→ checkVRMode
+            # 凑够 2 个失败项 → 桌面闪退。用占位普通文件把节点撑住 1~2 轮，
+            # 真控制口回来后由上面的 CTRL 分支自动换回 symlink。
+            # 窗口期 WalleDev 若 open 到占位文件，ioctl 失败与节点消失等价，
+            # 不会比原来更糟；真拔出时（MISS>=3）占位立即清除。
+            if [ ! -e /dev/hwvr1 ]; then
+                rm -f /dev/hwvr1
+                : > /dev/hwvr1 2>/dev/null && chmod 666 /dev/hwvr1 2>/dev/null && \
+                    echo "$(date) [EMI 宽限] /dev/hwvr1 占位（hidraw 暂失）" >> "$LOG"
+            fi
         fi
     fi
 

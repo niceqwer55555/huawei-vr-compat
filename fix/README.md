@@ -943,3 +943,59 @@ fail=0`、`PrepareActivity Quit=0`、`OnApplicationQuit=0`、16/16 次栈顶
 > 禁用重连，属线缆、Type-C 转接、hub 供电或环境干扰范畴。软件修复消除了
 > 「每次抖动都闪退」，但如果 EMI 事件本身仍频繁，画面仍可能短暂黑一下；
 > 要彻底消除需检查线缆与供电。
+
+### 11.9 闪退复发：框架层 USB 瞬态宽限（2026-11-08 第四轮，已修）
+
+11.8 去掉守护的 `GET_FEATURE` 后，04:19 与 04:41–04:42 仍出现
+`disabled by hub (EMI?)` 抖动，桌面又走了一遍：
+
+```
+usb 1-1 / 1-1.1 / 1-1.2 / 1-1.5: USB disconnect
+VrPlatformCompat: glass probe: usb=false externalDisplay=true
+VrMonitor: checkVRMode fail, isVRGlassDevExist:false  isVRMode:false
+VRService_Client_VRPrepareActivity: PrepareActivity Quit!
+Process com.huawei.vrlauncherx (pid N) has died: fg TOP
+```
+
+**关键点**：设备上的 launcherx 跑的是我们 patch 过的
+`VrMonitor.isVRGlassDevExist() → VrPlatformCompat.isVrGlassPresent()`，
+判据是 `UsbManager.getDeviceList()` 里有没有 `12d1:1092` / `12d1:107e`
+，**不是** `/dev/hwvr1` 文件。EMI 窗口里 USB 设备全消失，列表必然为空，
+所以 11.8 的纯守护侧改动挡不住这一下。
+
+修复必须两层同时部署：
+
+| 层 | 文件 | 改动 |
+|---|---|---|
+| 框架 | `patches/vrdesktop/fix_glass_grace.py` + `apply_glass_grace.sh` | patch launcherx 的 `classes4.dex` 里 `VrPlatformCompat.hasGlassUsbIdentity()`：UsbManager 枚举不到时回退华为**原版**判据 `new File("/dev/hwvr1").exists()` |
+| 守护 | `magisk-module/modules/service.sh` | hidraw 全消失的 3 轮宽限内，用**占位普通文件**顶住 `/dev/hwvr1`（断链 symlink 的 `File.exists()` 是 false）；真拔出时清除 |
+
+一键重出包（拉底本 → baksmali → patch → smali → 替换 dex → zipalign →
+重签 → `pm install -r`）：
+
+```sh
+sh fix/patches/vrdesktop/apply_glass_grace.sh 192.168.43.133:5555
+```
+
+产物归档 `fix/apks/com.huawei.vrlauncherx.glass-grace.apk`（与现包同
+`hvr-compat-debug.jks` 签名），原包备份在
+`build/tmp/glass_grace/base.orig.apk`。安装会 force-stop 桌面并清空注册表，
+守护的 15 秒巡检会自动重发 `vr_system_state`。
+
+**验收**（04:38–04:42，3 分钟 / 90 次采样，期间 `disabled by hub` 8 次、
+`USB disconnect` 43 次）：`checkVRMode fail=0`、`PrepareActivity Quit=0`、
+`OnApplicationQuit=0`；守护日志出现 `[EMI 宽限] /dev/hwvr1 占位`，节点
+回来后自动换回 `hwvr1 -> /dev/hidraw2 (descLen=68)`（编号漂移照常跟随）。
+
+**剩余现象不是闪退循环**：EMI 抖动时系统会连带杀 `com.huawei.vrservice`
+与 `com.huawei.vrlauncherx`（`Scheduling restart of crashed service ...
+VrParamsProviderService`、`Killing ... ArvrRuntimeService`），栈顶短暂回到
+`com.droidlogic.mboxlauncher`，3~8 秒后 VRService 自动重拉桌面。这属于
+USB 链路层的进程级联，软件只能缩短恢复、消不掉抖动本身。
+
+> **EMI 根因线索（未修）**：`/sys/class/udc` 为空、`sys.usb.controller`
+> 为空、`g1/UDC` 为空，但 `sys.usb.config=adb` —— ROM 的 USB gadget 配置
+> 残缺。adbd 每秒 `FUNCTIONFS_BIND` 超时重建连接，init 每秒写
+> `/config/usb_gadget/g1/UDC`（60 秒日志内分别 63 次 / 254 次），怀疑持续
+> 扰动 USB 控制器。修它要动系统属性，**有中断无线 adb 的风险，未做**，
+> 需现场确认后再试。硬件侧仍需检查线缆、Type-C 转接与 hub 供电。
