@@ -10,7 +10,10 @@
 #           两者描述符前 3 字节都是 `06 ff 00`，不能只靠前缀判断；
 #           必须真发一次 HIDIOCGFEATURE(4)（hwvr-probe）或比对描述符长度。
 #     闸 2  vr_system_state binder 未发布 → CheckVrMode "is not VRMode" → SDK Quit。
-#   本脚本只读，不改设备状态。
+#   本脚本只读，不改设备状态。probe 仅在这里手动一次性调用；
+#   **守护主循环已改为纯 sysfs 描述符长度判据、不再每 3 秒发 GET_FEATURE**
+#   （2026-11-08 第三轮：频繁发 USB control transfer 会加剧 hub 端口
+#   `disabled by hub (EMI?)` 重连，导致「一进 VR 桌面就闪退」，见 README 11.8）。
 set -u
 
 SERIAL="${1:-192.168.43.133:5555}"

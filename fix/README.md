@@ -810,7 +810,7 @@ adb shell content call --uri content://com.huawei.vrlauncherx.registry \
 
 | 文件 | 改动 |
 |---|---|
-| `magisk-module/modules/service.sh` | 选点改为「`06ff00` 候选 + `hwvr-probe` 协议应答优先 + 描述符长度兜底」，去掉 `break`；拉桌面之前查 `vr_system_state`，缺失则重启 Runtime 重发（最多 3 次） |
+| `magisk-module/modules/service.sh` | 选点改为「`06ff00` 候选 + 描述符实际长度、取最大者」，去掉 `break`；拉桌面之前查 `vr_system_state`，缺失则重启 Runtime 重发（最多 3 次）；**11.8 二次修正：守护主循环不再发任何 USB 请求** |
 | `magisk-module/modules/hwvr-probe` | 新增（从 `ksu/hwvr_compat/` 复制随模块部署） |
 | `install.sh` | step 2 增加 `chmod 755 hwvr-probe` |
 | `patches/vrdesktop/fix_battery_noop.py` | 补写（此前只在分析文档里被引用、未落盘）；幂等 no-op 化 `processBattery` 的 below-5 / below-20 两分支，已在两种 smali 变体上验证 |
@@ -823,8 +823,8 @@ adb shell content call --uri content://com.huawei.vrlauncherx.registry \
 # 只读体检（两道闸都应 [OK]）
 sh fix/tools/hwvr1-check.sh 192.168.43.133:5555
 
-# 守护改链接记录应出现新的判据标记
-adb shell su -c 'grep "probe+rank" /data/local/tmp/hidraw_perm.log | tail -3'
+# 守护改链接记录应出现判据标记（新版本 descLen，旧版本 probe+rank）
+adb shell su -c 'grep -E "descLen|probe\+rank" /data/local/tmp/hidraw_perm.log | tail -3'
 
 # 桌面启动链：无 ioGetVendorInfo failed、无 OnApplicationQuit
 adb shell logcat -c
@@ -890,3 +890,56 @@ adb shell am start -n com.huawei.vrlauncherx/.MainActivity
 **等 3~10 秒重跑即可**。守护的判据不依赖编号：重枚举后真控制口从
 `hidraw1` 变成 `hidraw0`，日志仍记录 `probe+rank=10068` 并正确跟随。
 USB 重枚举会连带清空注册表，11.4 的周期巡检同时覆盖这一场景。
+旧日志标记 `probe+rank=10068` 是第一版守护（每轮发 GET_FEATURE，已废弃，
+见 11.8），新版本日志标记为 `descLen=68`。
+
+### 11.8 「一进 VR 桌面就闪退」（2026-11-08 第三轮，已修）
+
+现象：桌面一进去就退回系统 Launcher，进程 pid 每 4~5 秒换一次。
+取证见 `build/tmp/analysis-1108-crash-onenter.log` / `crash-fixed.log`。
+
+```
+内核  usb usb1-port1: disabled by hub (EMI?), re-enabling...
+      usb 1-1 / 1-1.1 / 1-1.2 / 1-1.5: USB disconnect   ← 整条 hub 掉线
+      generic ttyUSB0..2: converter now disconnected
+框架  UsbHostManager: Removed device ... HUAWEI GLASS CV10 / HID
+      VrPlatformCompat: glass probe: usb=false externalDisplay=true
+      HvrVrSystem: isVRmode failed
+      VrMonitor: checkVRMode fail, isVRGlassDevExist:false  isVRMode:false
+      VRService_Client_VRPrepareActivity: PrepareActivity Quit!
+系统  ActivityManager: Process com.huawei.vrlauncherx (pid N) has died: fg TOP
+```
+
+`VrPlatformCompat.hasGlassUsbIdentity()` 遍历 `UsbManager.getDeviceList()`
+找 `12d1:1092` / `12d1:107e`；EMI 重枚举窗口里设备全消失 → 判 false →
+`VrMonitor.checkVRMode()` 凑够 2 个失败项 → SDK 自杀。随后系统/VR 服务又
+把 MainActivity 拉起（本次日志 `START u0 ... from uid 10074` 共 57 次），
+形成「一进就闪退」循环。**不是 FATAL/ANR（本次 0 次），也不是闸 2 缺失**。
+
+**加剧因素是上一版修复的回归**：11.4 第一版让守护每 3 秒对所有 `06ff00`
+候选各发一次 `hwvr-probe`（`HIDIOCGFEATURE(4)` control transfer），等于
+持续刺激 USB 总线。A/B 各 60 秒：
+
+| 组 | DEVNUM 变化 | hidraw=0 | 栈顶 |
+|---|---|---|---|
+| `kill -STOP` 冻结守护 | 1 次（007→011） | 0 | 稳定 |
+| 恢复旧守护 | 3 次（019→023→027） | 每次都出现 | 每次掉回 `com.droidlogic.mboxlauncher` |
+
+修复（已推设备、已验收）：
+
+1. 守护选点改**纯 sysfs**：只读 `report_descriptor` 前 3B + 实际字节数，
+   取 68B 的控制口（CV10 只有 28B）。零 USB 请求，且编号漂移也能跟随
+   —— 实测重枚举后正确选到 `hidraw0 (descLen=68)`。`hwvr-probe` 保留在
+   模块里，仅供 `hwvr1-check.sh` 手动一次性验证。
+2. hidraw 全消失时给 3 轮（约 9s）宽限才认定「眼镜拔出」，避免守护跟着
+   EMI 抖动摘链、反复重置拉桌面状态机。
+
+验收（03:50:04–03:52:11，每 6 秒采样共 16 次）：DEVNUM 恒 `043`（0 次
+重枚举）、hidraw 恒 3、`vr_system_state` 恒 `binder=`、`checkVRMode
+fail=0`、`PrepareActivity Quit=0`、`OnApplicationQuit=0`、16/16 次栈顶
+`.MainActivity`。内核最近一次 EMI 在 uptime 8605，采样窗口内无新增。
+
+> 硬件侧提示：`disabled by hub (EMI?)` 是 hub 端口因信号质量/供电波动被
+> 禁用重连，属线缆、Type-C 转接、hub 供电或环境干扰范畴。软件修复消除了
+> 「每次抖动都闪退」，但如果 EMI 事件本身仍频繁，画面仍可能短暂黑一下；
+> 要彻底消除需检查线缆与供电。

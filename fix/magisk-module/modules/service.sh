@@ -68,6 +68,8 @@ STATE_RETRY=0
 # 周期巡检时间戳（见主循环「vr_system_state 周期巡检」）
 STATE_LAST_CHECK=0
 STATE_REPAIR_LAST=0
+# hidraw 全部消失的连续轮数（EMI 重枚举瞬态宽限，见主循环）
+MISS=0
 
 while true; do
     for h in /dev/hidraw*; do
@@ -115,38 +117,44 @@ while true; do
     #    **拔插 USB 不解决**：守护每 3 秒重跑一次这个错误判据，每次拔插
     #    都把链接重新指回 hidraw0（hidraw_perm.log 03:08:18 实证）。
     #
-    # 新判据：候选仍限定 `06ff00`（排除 `05 0c` 按键口 / `05 01` Hub），
-    #   但必须再用 hwvr-probe 真发一次 HIDIOCGFEATURE(4) 验协议应答：
-    #   hidraw0 rc=4（失败）、hidraw1 rc=0（成功）。见
-    #   ksu/hwvr_compat/hwvr-probe.c 与 docs/HELMET_HID_PROTOCOL.md 第三章。
-    #   原注释「hidraw0/1 都返回 0，区分不了」是误读：0 是**进程退出码**
-    #   （= ioctl 返回 4 字节 = 成功），不是 ioctl 返回值。
-    #   没有 probe 二进制时自动退化为「描述符实际字节数最大者」
-    #   （28B vs 68B；sysfs stat 恒 4096，必须用 od 读实际长度）。
-    PROBE=${0%/*}/hwvr-probe
-    [ -x "$PROBE" ] || PROBE=/data/local/tmp/hwvr-probe
+    # 判据（2026-11-08 二次修正）：候选限定 `06ff00`（排除 `05 0c` 按键口
+    #   和 `05 01` Hub），取**报告描述符实际字节数最大者**：CV10 是 28B、
+    #   真控制口（12d1:107e input3）是 68B。sysfs 的 stat 恒为 4096，
+    #   必须用 od 读实际长度。纯 sysfs 读取，不向 USB 总线发任何请求。
+    #
+    # ⚠️ 不要在守护主循环里跑 hwvr-probe / HIDIOCGFEATURE(4)（2026-11-08
+    #    实测证伪的上一版）：每 3 秒对所有候选各发一次 GET_FEATURE，等于
+    #    持续刺激 USB 总线，内核开始刷
+    #      "usb usb1-port1: disabled by hub (EMI?), re-enabling..."
+    #    hub 端口每 ~20s 禁用重连一次，重连窗口里 hidraw 全消失 →
+    #    VrPlatformCompat 的 glass probe usb=false → VrMonitor.checkVRMode
+    #    fail → 桌面 SDK Quit（用户看到「一进 VR 桌面就闪退」）。
+    #    A/B（各 60s）：冻结守护 → 只重枚举 1 次、hidraw 全程 4 个；
+    #    恢复守护 → DEVNUM 019→023→027 共 3 次，每次 hidraw=0 且栈顶
+    #    掉回 com.droidlogic.mboxlauncher。
+    #    描述符长度判据与 probe 的结论一致（都选 hidraw1），但零 USB 请求，
+    #    也不依赖编号：重枚举后真控制口变成 hidraw0 时依然选得对。
+    #    hwvr-probe 保留在模块里，仅供 fix/tools/hwvr1-check.sh 手动一次性验证。
     CTRL=""
-    CTRL_RANK=-1
+    CTRL_LEN=-1
     for h in /sys/class/hidraw/hidraw*; do
         [ -e "$h" ] || continue
         pre=$(od -An -tx1 -N3 -v "$h/device/report_descriptor" 2>/dev/null | tr -d ' \n')
         [ "$pre" = "06ff00" ] || continue
-        dev="/dev/${h##*/}"
-        rank=0
-        if [ -x "$PROBE" ] && "$PROBE" "$dev" >/dev/null 2>&1; then
-            rank=10000
-        fi
         len=$(od -An -tx1 -v "$h/device/report_descriptor" 2>/dev/null | wc -w | tr -d ' \n')
         [ -n "$len" ] || len=0
-        rank=$((rank + len))
-        if [ "$rank" -gt "$CTRL_RANK" ]; then CTRL_RANK=$rank; CTRL="$dev"; fi
+        if [ "$len" -gt "$CTRL_LEN" ]; then
+            CTRL_LEN=$len
+            CTRL="/dev/${h##*/}"
+        fi
     done
     if [ -n "$CTRL" ]; then
+        MISS=0
         CUR=$(readlink /dev/hwvr1 2>/dev/null)
         if [ "$CUR" != "$CTRL" ]; then
             rm -f /dev/hwvr1
             ln -s "$CTRL" /dev/hwvr1 2>/dev/null && \
-                echo "$(date) hwvr1 -> $CTRL (probe+rank=$CTRL_RANK)" >> "$LOG"
+                echo "$(date) hwvr1 -> $CTRL (descLen=$CTRL_LEN)" >> "$LOG"
         fi
         # --- 眼镜插入自动拉起 VR 桌面（2026-11-08）---
         # 等 8 秒是给 USB 枚举 + 显示通路稳定；要求 VRService 已在跑，
@@ -192,17 +200,24 @@ while true; do
         fi
         GLASS_WAS=1
     else
-        # 眼镜拔出：摘掉死链，等插回再建
-        if [ -L /dev/hwvr1 ]; then
-            rm -f /dev/hwvr1
-            echo "$(date) hwvr1 清除（控制接口不在位）" >> "$LOG"
+        # EMI 重枚举瞬态宽限：hub 端口被禁用重连时 hidraw 会短暂（1~2 轮）
+        # 全部消失。立刻摘 symlink + 判定「眼镜拔出」会让守护跟着抖动，
+        # 并把桌面拉进「刚拉起就遇到节点消失 → checkVRMode fail → SDK Quit」
+        # 的闪退循环。连续 3 轮（约 9s）仍不在位才认定为真拔出。
+        MISS=$((MISS + 1))
+        if [ "$MISS" -ge 3 ]; then
+            # 眼镜拔出：摘掉死链，等插回再建
+            if [ -L /dev/hwvr1 ]; then
+                rm -f /dev/hwvr1
+                echo "$(date) hwvr1 清除（控制接口不在位）" >> "$LOG"
+            fi
+            if [ "$GLASS_WAS" = "1" ]; then
+                echo "$(date) 眼镜拔出，重插时将自动拉起 VR 桌面" >> "$LOG"
+            fi
+            GLASS_WAS=0
+            GLASS_LAUNCH_DONE=0
+            STATE_RETRY=0
         fi
-        if [ "$GLASS_WAS" = "1" ]; then
-            echo "$(date) 眼镜拔出，重插时将自动拉起 VR 桌面" >> "$LOG"
-        fi
-        GLASS_WAS=0
-        GLASS_LAUNCH_DONE=0
-        STATE_RETRY=0
     fi
 
     # --- vr_system_state 周期巡检（2026-11-08「打开应用就退出」补的缺口）---
