@@ -18,6 +18,14 @@
 #
 # 参数可任意顺序、可叠加。本脚本幂等，可反复执行。所有细节见 README.md。
 # 眼镜点亮部分严格复刻手册第六章成功流程，见 light-on.sh 头部注释。
+#
+# 2026-11-07 更新：一键安装现在会 ① 部署 wadb 无线 ADB 开机自启模块 +
+# 幂等写 persist./service.adb.tcp.port，② 点亮后等待设备端脚本内嵌的
+# 25 秒 adbd 自恢复窗口再做验收。因此整条链路可一次跑完，不再需要
+# PC 侧守护或手动拔电源。每次开机/断电后单独点亮只需一条：
+#   sh fix/light-on.sh <serial>
+# 注意：眼镜 HDMI/EDID 物理链路断开时，点亮脚本会自检拒绝（不误改配置），
+# 安装其余步骤照常完成。
 # =============================================================================
 set -u
 
@@ -84,6 +92,59 @@ root_() {
 }
 
 step() { echo; echo "===== $* ====="; }
+
+# ---------------------------------------------------------------------------
+# 2026-11-07：点亮会 stop/start surfaceflinger，adbd 的 5555 监听会掉。
+# 设备端 light-on.sh 自己是设备端进程，已内嵌「25 秒后 init 级
+# stop/start adbd」恢复监听（并幂等写 persist./service.adb.tcp.port），
+# 实测 uptime 连续、无需拔电源、无需 PC 侧守护。安装脚本必须等过这段
+# 窗口再继续，否则 6/7 验收、7/7 启动全是空输出 —— 旧版「一键安装
+# 跑不完」就卡在这里（原来只 sleep 3）。
+# ---------------------------------------------------------------------------
+adb_alive() {
+    "$ADB" connect "$SERIAL" >/dev/null 2>&1
+    "$ADB" -s "$SERIAL" shell "true" >/dev/null 2>&1
+}
+
+wait_adb() {
+    _max="${1:-90}"
+    _i=0
+    while [ "$_i" -lt "$_max" ]; do
+        adb_alive && return 0
+        sleep 3
+        _i=$((_i + 3))
+    done
+    return 1
+}
+
+# 无线 ADB 开机自启模块：刷机后 persist.adb.tcp.port 必丢，且点亮链路里
+# adbd 会被重拉。它纯 late_start、无 post-fs-data、无 mount，结构上不会
+# 卡 logo（2026-11-04 分阶段上车 A 阶段实测）。逐文件 push 避免目录嵌套。
+ensure_wadb() {
+    [ -f "$HERE/magisk-module/wadb/service.sh" ] || {
+        echo "  [wadb] 本地缺 wadb 模块文件，跳过"; return 1; }
+    "$ADB" -s "$SERIAL" shell mkdir -p /data/local/tmp/hvrfix/wadb >/dev/null 2>&1
+    for _f in module.prop service.sh customize.sh; do
+        MSYS2_ARG_CONV_EXCL='*' "$ADB" -s "$SERIAL" push \
+            "$HERE/magisk-module/wadb/$_f" "/data/local/tmp/hvrfix/wadb/$_f" >/dev/null 2>&1
+    done
+    R_SZ=$(sh_ "wc -c < /data/local/tmp/hvrfix/wadb/service.sh 2>/dev/null" | tr -d ' \r\n')
+    if [ "${R_SZ:-0}" -lt 500 ]; then
+        echo "  [wadb] 推送校验失败（service.sh ${R_SZ:-0}B），跳过部署，设备未改动"
+        return 1
+    fi
+    root_ "mkdir -p /data/adb/modules/wadb /data/adb/wadb; \
+cp -f /data/local/tmp/hvrfix/wadb/module.prop /data/adb/modules/wadb/module.prop; \
+cp -f /data/local/tmp/hvrfix/wadb/service.sh  /data/adb/modules/wadb/service.sh; \
+chmod 644 /data/adb/modules/wadb/module.prop; \
+chmod 755 /data/adb/modules/wadb/service.sh; \
+setprop persist.adb.tcp.port 5555; \
+setprop service.adb.tcp.port 5555; \
+rm -rf /data/local/tmp/hvrfix/wadb" >/dev/null 2>&1
+    WADB_SZ=$(root_ 'wc -c < /data/adb/modules/wadb/service.sh 2>/dev/null' | tr -d ' \r\n')
+    echo "  [wadb] 开机 5555 自启就位（service.sh ${WADB_SZ:-0}B, persist port $(sh_ 'getprop persist.adb.tcp.port')）"
+    echo "  [wadb] 端口属性 persist/service.adb.tcp.port = 5555（幂等重写）"
+}
 
 # =============================================================================
 # 开机即亮稳定态（10-30 / 11-02 历史成功配方，2026-11-06 从另两个项目的
@@ -284,7 +345,7 @@ else
     echo "  [i] system overlay 未部署（默认；卡 logo 排查期间保持关闭）"
 fi
 
-# --- 开机即亮稳定态（默认部署，--no-stable-boot 可关）---
+# --- 开机即亮稳定态（已证伪，默认不部署；显式 stable 才上车）---
 if [ "$STABLE_BOOT" = "1" ]; then
     deploy_stable_boot
 else
@@ -300,6 +361,9 @@ elif [ "$TTYUSB_GUARD" = "0" ]; then
     echo "  [i] ttyUSB 守护 = off"
 fi
 root_ "rm -rf /data/local/tmp/hvrfix/magisk-module" >/dev/null 2>&1
+
+# --- 无线 ADB 开机自启（刷机后必丢；也是点亮后 adbd 重拉能监听 5555 的前提）---
+ensure_wadb
 
 echo "  模块: $(root_ 'ls /data/adb/modules/hvrglass/module.prop && echo OK')"
 echo "  显示当前内核输出时序："
@@ -340,10 +404,30 @@ step "5/7 一键点亮 VR 眼镜（严格按手册第六章成功流程）"
 # 否则直接拒绝、不写属性也不重启 SF —— 眼镜失活时盒子单方面强扭没用。
 # 注意：绝不用 setprop ctl.restart surfaceflinger（手册 4.2 实测整机重启/卡死）。
 if [ "$LIGHT_ON" = "1" ]; then
+    # 只有「当前没点亮」时设备端才会真的 stop/start SF，并安排 25 秒后
+    # init 级重拉 adbd。等过这段窗口再验收，否则 6/7 进程列表会是空的，
+    # 且 adbd 重拉会打断紧接着的命令。已点亮时走快速路径，不多等。
+    PRE_LIT=$(root_ 'head -7 /sys/kernel/debug/dri/0/summary | grep -c 3200x1600p70' | tr -d '\r\n ')
+    case "$PRE_LIT" in ''|*[!0-9]*) PRE_LIT=0 ;; esac
+    echo "  [i] 点亮前物理输出命中 3200x1600p70 的行数 = $PRE_LIT"
     root_ "sh /data/adb/hvrglass/light-on.sh" | sed 's/^/  /'
-    # SF 重启后重连一次，保证后面的验收与启动步骤可用
-    sleep 3
-    "$ADB" connect "$SERIAL" >/dev/null 2>&1
+    if [ "$PRE_LIT" = "0" ]; then
+        echo "  [i] 本次触发 SF 重启，等待设备端 25 秒 adbd 自恢复窗口（约 30 秒）..."
+        sleep 30
+    fi
+    if wait_adb 60; then
+        echo "  [i] 无线 ADB 已恢复，继续验收（无需拔电源、无需守护）"
+        # stop/start surfaceflinger 会把 4/7 刚拉起的 VR 服务一并冲掉
+        # （2026-11-07 实测：装完只剩 7/7 启动的应用市场，6/7 进程为空）。
+        # 点亮完成后补拉一次，保证安装结束时 VR 栈是活的。
+        echo "  [i] 点亮后补拉 VR 服务（SF 重启会冲掉 4/7 拉起的进程）..."
+        root_ "am start-service -n com.huawei.vrservice/com.huawei.vrservice.VRService; am start-service -n com.huawei.hvrsdkserverapp/com.huawei.hvrsdkserverapp.service.ArvrRuntimeService" >/dev/null 2>&1
+        sleep 3
+    else
+        echo "  [WARN] 90 秒内无线 ADB 未恢复，下面验收可能为空。"
+        echo "         设备端日志仍在 /data/local/tmp/hvr-light-on.log；"
+        echo "         稍后执行 sh fix/light-on.sh $SERIAL 可复查显示时序。"
+    fi
 else
     echo "  （--no-light-on，跳过。随时可跑: sh fix/light-on.sh 或双击 fix/一键点亮.bat）"
 fi
@@ -353,7 +437,13 @@ step "6/7 状态验收"
 echo "-- 已安装的华为 VR 包 --"
 sh_ "pm list packages" | grep -E 'com\.huawei\.(appmarket\.vr|vrlauncherx|himovie\.vr|vrvirtualscreen|vrhandle|hvrsdkserverapp|vrservice)' | sed 's/^/  /'
 echo "-- 关键进程 --"
-sh_ "ps -A | grep -E 'vrservice|vrvirtualscreen|vrhandle|himovie|hvrsdkserverapp|vrlauncherx|appmarket' | grep -v grep" | sed 's/^/  /' || echo "  （应用尚未启动，属正常）"
+PROCS=$(sh_ "ps -A | grep -E 'vrservice|vrvirtualscreen|vrhandle|himovie|hvrsdkserverapp|vrlauncherx|appmarket' | grep -v grep")
+if [ -n "$PROCS" ]; then
+    echo "$PROCS" | sed 's/^/  /'
+else
+    echo "  （暂无 VR 服务进程：若 5/7 刚重启过 surfaceflinger，framework 重启后需数十秒由模块拉回；"
+    echo "    7/7 应用市场能启动即表示安装成功，可稍后 adb shell ps -A | grep vr 复查）"
+fi
 echo "-- vr_system 服务（目前仍缺，属已知问题，非安装失败）--"
 if sh_ "service list" | grep -q vr_system; then
     echo "  vr_system 已注册！（意外之喜，说明系统侧桩已生效）"
@@ -372,8 +462,9 @@ fi
 
 echo
 echo "===== 完成 ====="
-echo "  ⚠️ 跑点亮前先开：    sh fix/adb-keepalive.sh $SERIAL on   # 防 SF 重启后 5555 失联"
+echo "  ⚠️ 每次开机/断电后：  sh fix/light-on.sh $SERIAL   # 一条即可，ADB 自动恢复；守护可选"
 echo "  眼镜没亮 / 之后又黑：sh fix/light-on.sh 或双击 fix/一键点亮.bat"
+echo "  眼镜物理链路检查：    sh fix/light-on.sh $SERIAL check  # status/EDID/modes 为空就是没插好或没激活"
 echo "  只体检不改动：      sh fix/light-on.sh $SERIAL check"
 echo "  接便携屏前：        sh fix/light-on.sh $SERIAL off"
 echo "  开机即亮稳定态：    sh install.sh $SERIAL --stable-check | stable | --stable-off"

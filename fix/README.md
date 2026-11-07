@@ -12,15 +12,38 @@
 >
 > 只想重装模块/授权不动 APK：`sh install.sh <serial> --skip-install`
 >
+> **2026-11-07 一键安装工具已更新并实跑验收**：`install.sh` 现在会
+> ① 部署 `wadb` 无线 ADB 开机自启模块（刷机后 `persist.adb.tcp.port`
+> 必丢）并幂等写两个 adb tcp 端口属性；② 点亮后**等待设备端脚本内嵌的
+> 25 秒 adbd 自恢复窗口**再做验收与启动；③ 点亮后**补拉 VR 服务**
+> （`stop/start surfaceflinger` 会把第 4 步刚拉起的 vrservice /
+> hvrsdkserverapp 冲掉，实测装完只剩应用市场、进程列表为空）。
+> 整条链路一次跑完，装完 VR 栈是活的，不再出现「装到一半 ADB 断了、
+> 后面全是空输出」。`light-on.sh` / `一键点亮.bat` 也改为
+> 「执行 → 等 ADB 自恢复 → 回读设备端日志 + 内核时序」，
+> 不再只打印一个断连错误。**PC 侧守护与拔电源都不再需要。**
+>
 > **眼镜没亮 / 刷机后单独点亮**：双击 `一键点亮.bat`，或 `sh light-on.sh`
 > （自包含，不用先跑完整安装）。只体检：`sh light-on.sh <serial> check`
 >
-> ⚠️ **跑点亮前先开无线 adb 守护**：`sh fix/adb-keepalive.sh <serial> on`
-> `stop/start surfaceflinger` 会冲掉 adbd 的 5555 监听；而 wadb 模块的
-> 自检是「开机阶段有限 10 次、成功后即退出」，运行中掉线没人补 ——
-> 表现为设备 `ping` 得通但 adb 全断，只能手动拔电源，而拔电源又把刚
-> 点亮的 3200 清掉（2026-11-06 连着复现 4 次）。守护是纯运行时后台
-> 进程，不改开机逻辑、不改模块、重启即失效；`off` 可随时停。
+> ⚠️ **每次开机 / 断电后都要重跑点亮**（HWC 首次 Init 选不到 3200）：
+> `sh fix/light-on.sh <serial>` —— **一条即可，守护可选**。
+> 2026-11-07 08:17 `adb reboot` 实测：开机不自动亮（1080p60），
+> 单跑这一条后 HWC 217→4371、`clk[412180]`，ADB 自恢复、5 次采样稳定。
+>
+> ⚠️ **无线 ADB 掉线已内嵌修复（2026-11-07 08:10 实测闭环）**：
+> `stop/start surfaceflinger` 会冲掉 adbd 的 5555 监听。PC 侧
+> `adb-keepalive.sh` 派生的守护是 `adb shell → su -c` 的后代，SF 停止时
+> 会被会话一起清理（`nohup` / `setsid` 实测均无效，守护日志连
+> 「5555 lost」都来不及写），表现为 `ping` 通但 5555 长时间拒绝，
+> 只能拔电源靠 wadb 开机自检恢复 —— 而拔电源又把刚点亮的 3200 清零。
+> 还有一层根因：重拉 adbd 时只写 `service.adb.tcp.port` 不够，必须同时
+> 写 `persist.adb.tcp.port`，否则 adbd 重启后不开 TCP 监听。
+> 现在 `magisk-module/runtime/light-on.sh`（设备端进程，实测能活过
+> SF 重启）自己幂等写这两个属性，并在 25 秒后由子 shell 做 init 级
+> `stop/start adbd`，**PC 侧无需断电即可连回复验**。08:10 实测
+> `uptime` 连续、`clk[412180]` 4 次采样稳定、`LISTEN=2`。
+> 守护仍可开（纯运行时、不改开机逻辑、`off` 可停），但已非必需。
 >
 > ✅ **2026-11-07 07:00 竞态根因钉死 + 修复，点亮已确定性化**：
 > `stop surfaceflinger` 后 HWC 要**约 4 秒**才跟着退出（客户端死亡），
@@ -28,12 +51,13 @@
 > 旧版脚本 `sleep 2` 太短，`start` 把还没退出的旧 HWC 又接回去 →
 > HWC 不重新 Init → 永远 1080p。**历史「时灵时不灵」全是这个竞态**
 > （成功案例 HWC PID 都换过，失败案例 PID 不变）。修复版
-> `magisk-module/runtime/light-on.sh`（md5 `5cc4a2d4…`）改为
+> `magisk-module/runtime/light-on.sh`（竞态修复版 `5cc4a2d4…`；
+> 08:10 加入无线 ADB 自恢复后 `abd6022a…`）改为
 > **盯住 `init.svc_debug_pid.vendor.hwcomposer-2-1` 变化再启动 SF**，
 > 2026-11-07 实测一次成功且 60 秒稳定采样全绿（`clk[412180]`）。
 > 已部署到设备 `/data/adb/hvrglass/light-on.sh`。
-> **固定用法（每次开机/断电后）**：
-> `sh fix/adb-keepalive.sh <serial> on && sh fix/light-on.sh <serial>`
+> **固定用法（每次开机/断电后）**：`sh fix/light-on.sh <serial>`
+> 守护 `sh fix/adb-keepalive.sh <serial> on` 可选，非必需。
 >
 > **点亮的正解在整机备份里**（`backup/box-2026-11-05/`）：
 > `hvrglass_runtime.tar.gz` / `data_adb.tar.gz` 保存着 11-05 22:33
@@ -79,7 +103,7 @@
 > 本机没有 rkdeveloptool 命令行版；命令行等价为
 > `rkdeveloptool wl 51200 <原boot.img>`。
 > 实验工具：`fix/boot-whitelist.sh`（空白名单，可 `off` 回退）、
-> `fix/adb-keepalive.sh`（防 SF 重启后 5555 失联）。
+> `fix/adb-keepalive.sh`（无线 ADB 运行时守护，**可选**，主链路已内嵌自恢复）。
 >
 > **开机即亮稳定态**（单模式 EDID + systemless 白名单 + force-vr，二·9）
 > 2026-11-06 两次受控重启实测**均未点亮**，因此 `install.sh` **默认不再部署**；
@@ -97,15 +121,16 @@
 |---|---|---|
 | `install.sh` | **一键安装脚本**（装 APK → 部署模块 → 授权 → 一键点亮 → 验收） | — |
 | `light-on.sh` / `一键点亮.bat` | **一键点亮眼镜**（本地入口，自动 push 设备端脚本） | — |
-| `adb-keepalive.sh` / `adb-keepalive-daemon.sh` | **无线 adb 5555 运行时守护**；`on/off/check`（跑点亮前先 `on`，防 SF 重启后失联） | nohup 后台进程（重启失效） |
+| `adb-keepalive.sh` / `adb-keepalive-daemon.sh` | 无线 adb 5555 运行时守护；`on/off/check`。**已非必需**（2026-11-07 起 ADB 自恢复内嵌在设备端点亮脚本里），保留作可选冗余 | nohup 后台进程（重启失效） |
 | `ttyusb-compat.sh` | vcom (`/dev/ttyUSB*`) 运行时绑定 + 权限校正；`check/on/off/watch` | 运行时 sysfs（重启失效） |
 | `ddc-passthrough.sh` | DDC / EDID 直通验证；`check/passthrough/restore/reboot/verify` | `/data/adb/hvrglass/mode` |
 | `restart-hwc.sh` | HWC 选模取证；`check/restart/verify`（**勿当点亮手段**，restart 实测整机重启且无效） | — |
 | `一键修复VR框架.sh` / `一键修复VR框架.bat` | **修 VR 桌面链路**（装四个最终补丁 → 开模拟辅助显示 → 启 `.MainActivity`；`check/off/rollback/launcher`） | 手册第 8 章 |
 | `patches/vrdesktop/` | 四个最终补丁 APK（launcherx / vrservice / hvrsdkserverapp / **vrhandle-pose**）、回退基线、最小差分构建脚本 | 手册第 8 章 |
 | `apks/` | 7 个华为 VR 包，已去 sharedUserId、统一 hvr-compat 签名 | `pm install` |
-| `magisk-module/modules/` | hvrglass 模块本体（EDID 按需注入 + hidraw 权限轮询） | `/data/adb/modules/hvrglass/` |
-| `magisk-module/runtime/` | EDID 运行时切换脚本 + 1080p EDID + **light-on.sh 点亮脚本** | `/data/adb/hvrglass/` |
+| `magisk-module/modules/` | hvrglass 模块本体（EDID 按需注入 + hidraw 权限轮询 + ttyUSB vcom 兼容开关） | `/data/adb/modules/hvrglass/` |
+| `magisk-module/runtime/` | EDID 运行时切换脚本 + 1080p EDID + **light-on.sh 点亮脚本**（已内嵌竞态修复与 ADB 自恢复） | `/data/adb/hvrglass/` |
+| `magisk-module/wadb/` | **无线 ADB 开机自启**（纯 late_start、无 post-fs-data、无 mount，不会卡 logo）；开机自检重拉 5555 | `/data/adb/modules/wadb/`（install.sh 自动部署） |
 | `tools/` | 重签 / EDID 生成 / OTA 验证 / hwext 补丁 / 授权脚本 | PC 侧 |
 | `signing/hvr-compat-debug.jks` | 签名密钥（PKCS#12，口令 `android`）——七个包必须同签名 | PC 侧 |
 | `分析汇总.md` | 本轮全部分析的汇总（细节文档在仓库 `docs/`） | — |
@@ -116,12 +141,16 @@
 2. **装 7 个 APK**（`install -r -d`；遇 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`
    自动卸载重装——签名和旧包不一致时必走这条路，数据会丢）
 3. **部署 hvrglass 模块**：`modules/` → `/data/adb/modules/hvrglass/`，
-   `runtime/` → `/data/adb/hvrglass/`，权限 755/644
+   `runtime/` → `/data/adb/hvrglass/`，权限 755/644；
+   同时部署 `wadb` → `/data/adb/modules/wadb/` 并幂等写
+   `persist./service.adb.tcp.port=5555`（刷机后开机也能自动有无线 ADB）
 4. **`settings put system PRIVACY_ACCEPTED 1`**（绕过 launcherx 隐私页崩溃）
 5. **补授权**（调 `tools/grant-vr-perms.sh`：appops、pm grant、deviceidle 白名单、日志级别）
 6. **一键点亮眼镜**（调设备端 `light-on.sh`：白名单 bind mount → resolution 属性 →
-   一次 `stop/start surfaceflinger` → 验收 3200x1600p70；`--no-light-on` 可跳过。
-   眼镜没激活时脚本自检拒绝，不会强扭）
+   等 HWC PID 变化 → 一次 `stop/start surfaceflinger` → 验收 3200x1600p70；
+   `--no-light-on` 可跳过。眼镜没激活时脚本自检拒绝，不会强扭）。
+   点亮后安装脚本会等过设备端 25 秒 `adbd` 自恢复窗口，并补拉被 SF
+   重启冲掉的 VR 服务，再继续 7/8 步，否则验收与启动会全是空输出
 7. **验收**：包列表、进程列表、`vr_system` 状态
 8. **启动应用市场**冒烟（`--no-launch` 可关）
 9. **点亮配置按 11-05 备份态**（`mode=auto` / 白名单 `528d4e07…` / `light-on.sh` `e3253876…`）：见顶部说明
@@ -179,6 +208,9 @@ HWC 6.03s，或让 HWC 读到空白名单触发 `mode_verify` 全放行）。这
 ## 三、装完怎么验证
 
 ```sh
+# 0. 眼镜物理链路（disconnected / EDID 0 字节 = 没插好或没激活，点亮会被正确拒绝）
+adb shell su -c 'cat /sys/class/drm/card0-HDMI-A-1/status; cat /sys/class/drm/card0-HDMI-A-1/modes'
+
 # 1. 七个包都在
 adb shell pm list packages | grep com.huawei
 

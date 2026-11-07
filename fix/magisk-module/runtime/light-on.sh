@@ -86,6 +86,14 @@ esac
 [ "$(id -u)" = "0" ] || die "需要 root：su -c 'sh /data/adb/hvrglass/light-on.sh'"
 echo "===== $(date) 一键点亮开始 =====" >> "$LOG"
 
+# ---------------------------------------------------------------- 无线 ADB 端口属性
+# wadb 开机自检会同时写这两个属性；运行中重拉 adbd 时若只有 service.*，
+# 重启后的 adbd 不开 TCP 监听，5555 永远不通 —— 这正是 2026-11-07
+# 「点亮其实成功、却只能拔电源才能连回 ADB、一拔又把 3200 清零」的根因。
+# 每次点亮幂等重写，保证后续任何一次 adbd 重拉都会监听 5555。
+setprop persist.adb.tcp.port 5555
+setprop service.adb.tcp.port 5555
+
 # ---------------------------------------------------------------- 前置闸门
 [ "$status" = "connected" ] || die "HDMI 未连接（$status）。先把眼镜插好再跑。"
 if [ "$n3200" -lt 1 ]; then
@@ -137,6 +145,25 @@ fi
 HWC_PID_PROP=init.svc_debug_pid.vendor.hwcomposer-2-1
 old_hwc=$(getprop $HWC_PID_PROP)
 log "[3/3] stop surfaceflinger；等待 HWC 跟随重启（PID $old_hwc -> ?）..."
+
+# ---------------------------------------------------------------- 点亮后自恢复无线 ADB
+# stop/start surfaceflinger 会冲掉 adbd 的 5555 监听。PC 侧
+# fix/adb-keepalive.sh 派生的守护是 adb shell → su -c 的后代，SF 停止时
+# 会被会话一起清理（nohup / setsid 实测均无效，守护日志连「5555 lost」
+# 都来不及写），结果只能靠拔电源后的 wadb 开机自检恢复 —— 而拔电源
+# 又把刚点亮的 3200 清零，形成死循环。
+# 本脚本是设备端进程且实测能活过 SF 重启，故由它自己安排一次定时重拉：
+# 25 秒后（SF 已起、HWC 已选模、验收日志已写完）init 级 stop/start adbd，
+# PC 侧无需断电即可连回复验。子 shell 的父进程是本脚本，不会被清理。
+(
+    sleep 25
+    setprop service.adb.tcp.port 5555
+    setprop ctl.stop adbd 2>/dev/null
+    sleep 1
+    setprop ctl.start adbd 2>/dev/null
+) &
+log "[adb] 已安排 25 秒后重拉 adbd 恢复 5555（无需拔电源）"
+
 stop surfaceflinger
 hwc_new=""
 i=0

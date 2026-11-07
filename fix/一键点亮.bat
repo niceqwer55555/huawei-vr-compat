@@ -60,6 +60,31 @@ if errorlevel 1 (
 echo.
 "%ADBEXE%" -s %SERIAL% shell "su -c 'sh /data/adb/hvrglass/light-on.sh %ACTION%'"
 echo.
+
+rem stop surfaceflinger 会冲掉 5555 监听；设备端脚本会在 25 秒后自行
+rem init 级重拉 adbd 恢复。等过这段窗口再回读日志，否则这里只看到断连。
+if /i not "%ACTION%"=="on" goto SHOW
+echo [i] 等待设备端收尾 / 无线 ADB 自恢复（约 30 秒，最多 90 秒）...
+set /a N=0
+:WAIT
+ping -n 4 127.0.0.1 >nul
+set /a N=N+3
+"%ADBEXE%" connect %SERIAL% >nul 2>&1
+"%ADBEXE%" -s %SERIAL% shell true >nul 2>&1
+if errorlevel 1 goto WAIT_NEXT
+if %N% GEQ 30 goto SHOW
+:WAIT_NEXT
+if %N% LSS 90 goto WAIT
+
+:SHOW
+echo.
+echo === 设备端日志（尾部）===
+"%ADBEXE%" -s %SERIAL% shell "su -c 'tail -14 /data/local/tmp/hvr-light-on.log'" 2>nul
+echo.
+echo === 内核物理输出（点亮硬指标）===
+"%ADBEXE%" -s %SERIAL% shell "su -c 'head -7 /sys/kernel/debug/dri/0/summary'" 2>nul | findstr /C:"Display mode:" /C:"clk["
+echo.
+echo [i] 每次开机/断电后重跑本脚本即可（无线 ADB 自动恢复，无需拔电源）
 echo [i] 设备端完整日志：/data/local/tmp/hvr-light-on.log
 echo.
 pause
