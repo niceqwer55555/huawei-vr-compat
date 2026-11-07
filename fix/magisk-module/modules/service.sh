@@ -63,6 +63,11 @@ TTYUSB_REGISTERED=0
 GLASS_WAS=0
 GLASS_SEEN=0
 GLASS_LAUNCH_DONE=0
+# vr_system_state 重发尝试次数（拔出眼镜时复位）
+STATE_RETRY=0
+# 周期巡检时间戳（见主循环「vr_system_state 周期巡检」）
+STATE_LAST_CHECK=0
+STATE_REPAIR_LAST=0
 
 while true; do
     for h in /dev/hidraw*; do
@@ -95,47 +100,94 @@ while true; do
                 ;;
         esac
     done
-    # --- /dev/hwvr1 控制接口维护（2026-11-07 改为按描述符探测）---
-    # vrservice/WalleDev 硬编码打开 /dev/hwvr1；眼镜的 HIDIOCSFEATURE(5)
-    # 激活命令必须发到「控制接口」才能点亮面板。
+    # --- /dev/hwvr1 控制接口维护（2026-11-08 判据修正）---
+    # vrservice/WalleDev 硬编码打开 /dev/hwvr1；ioGetVendorInfo() 要发
+    # HIDIOCGFEATURE(4)/report 1，激活命令 HIDIOCSFEATURE(5) 也必须发到
+    # 「能按协议应答的控制接口」才能点亮面板。
     #
-    # ⚠️ 不能写死 hidraw 编号：2026-11-07 实测用户拔插眼镜后 CV10 那个
-    # hidraw 消失，编号整体前移，真控制接口从 hidraw1 变成 hidraw0，
-    # 而 hidraw1 变成 Consumer Control 按键口。旧逻辑仍指向 hidraw1，
-    # 结果 DevHid "No Glass data" 723 次、hidraw "too short report"、
-    # 激活发不出、眼镜面板不亮（用户："眼镜里没有画面"）。
+    # ⚠️ 旧判据（2026-11-07）：取「描述符前 3 字节 == 06ff00」的**第一个**
+    #    匹配就 break。2026-11-08 真机实测证伪：CV10(hidraw0, 12d1:1092)
+    #    与真控制口(hidraw1, 12d1:107e input3) 前 3 字节完全相同，
+    #    但 CV10 描述符只有 28B、report 1 仅 1 字节，应答不了 4 字节的
+    #    GET_FEATURE。后果：ioGetVendorInfo 恒失败 → WalleAlg 加载失败 →
+    #    Unity OnApplicationQuit → 桌面退回 VRPrepareActivity；激活命令
+    #    也发不出去（active device(2) OK 从不出现）→ 眼镜面板黑屏。
+    #    **拔插 USB 不解决**：守护每 3 秒重跑一次这个错误判据，每次拔插
+    #    都把链接重新指回 hidraw0（hidraw_perm.log 03:08:18 实证）。
     #
-    # 判据用 HID 报告描述符，不依赖编号也不写死 VID/PID：
-    #   控制接口 (12d1:107e input3) 以 `06 ff 00` 开头（Vendor Defined
-    #     Usage Page），report 1 是 59 字节 IMU、Feature id4 127 字节；
-    #   Consumer Control 按键口以 `05 0c` 开头，Hub 以 `05 01` 开头。
-    # 注：ksu/hwvr_compat/hwvr-probe 的 GET_FEATURE(4) 在本机 hidraw0/1
-    #     都返回 0，无法区分，所以这里用描述符。
+    # 新判据：候选仍限定 `06ff00`（排除 `05 0c` 按键口 / `05 01` Hub），
+    #   但必须再用 hwvr-probe 真发一次 HIDIOCGFEATURE(4) 验协议应答：
+    #   hidraw0 rc=4（失败）、hidraw1 rc=0（成功）。见
+    #   ksu/hwvr_compat/hwvr-probe.c 与 docs/HELMET_HID_PROTOCOL.md 第三章。
+    #   原注释「hidraw0/1 都返回 0，区分不了」是误读：0 是**进程退出码**
+    #   （= ioctl 返回 4 字节 = 成功），不是 ioctl 返回值。
+    #   没有 probe 二进制时自动退化为「描述符实际字节数最大者」
+    #   （28B vs 68B；sysfs stat 恒 4096，必须用 od 读实际长度）。
+    PROBE=${0%/*}/hwvr-probe
+    [ -x "$PROBE" ] || PROBE=/data/local/tmp/hwvr-probe
     CTRL=""
+    CTRL_RANK=-1
     for h in /sys/class/hidraw/hidraw*; do
         [ -e "$h" ] || continue
-        d=$(od -An -tx1 -N3 -v "$h/device/report_descriptor" 2>/dev/null | tr -d ' \n')
-        [ "$d" = "06ff00" ] && { CTRL="/dev/${h##*/}"; break; }
+        pre=$(od -An -tx1 -N3 -v "$h/device/report_descriptor" 2>/dev/null | tr -d ' \n')
+        [ "$pre" = "06ff00" ] || continue
+        dev="/dev/${h##*/}"
+        rank=0
+        if [ -x "$PROBE" ] && "$PROBE" "$dev" >/dev/null 2>&1; then
+            rank=10000
+        fi
+        len=$(od -An -tx1 -v "$h/device/report_descriptor" 2>/dev/null | wc -w | tr -d ' \n')
+        [ -n "$len" ] || len=0
+        rank=$((rank + len))
+        if [ "$rank" -gt "$CTRL_RANK" ]; then CTRL_RANK=$rank; CTRL="$dev"; fi
     done
     if [ -n "$CTRL" ]; then
         CUR=$(readlink /dev/hwvr1 2>/dev/null)
         if [ "$CUR" != "$CTRL" ]; then
             rm -f /dev/hwvr1
             ln -s "$CTRL" /dev/hwvr1 2>/dev/null && \
-                echo "$(date) hwvr1 -> $CTRL (control iface)" >> "$LOG"
+                echo "$(date) hwvr1 -> $CTRL (probe+rank=$CTRL_RANK)" >> "$LOG"
         fi
         # --- 眼镜插入自动拉起 VR 桌面（2026-11-08）---
         # 等 8 秒是给 USB 枚举 + 显示通路稳定；要求 VRService 已在跑，
-        # 否则桌面起来也进不了 VR 模式，眼镜黑屏。
+        # 并且 vr_system_state 已发布（第二道闸，见下）。
         T=$(date +%s)
         if [ "$GLASS_WAS" != "1" ]; then
             GLASS_SEEN=$T
         fi
         if [ "$GLASS_LAUNCH_DONE" != "1" ] && [ $((T - GLASS_SEEN)) -ge 8 ] \
            && [ -n "$(pidof com.huawei.vrservice 2>/dev/null)" ]; then
-            if am start -n com.huawei.vrlauncherx/.MainActivity >/dev/null 2>&1; then
+            # vr_system_state 注册表是 com.huawei.vrlauncherx 进程内的
+            # static Map（VrSystemRegistryProvider）。force-stop 桌面、
+            # 拔插眼镜引起的进程重建都会清空它；HvrStatePublisher 只在
+            # ArvrRuntimeService 启动握手时发布一次，不会补发。
+            # 缺它 → Unity "CheckVrMode, is not VRMode, exit" → SDK Quit。
+            VR_STATE=0
+            R=$(timeout 5 content call \
+                  --uri content://com.huawei.vrlauncherx.registry \
+                  --method getService --arg vr_system_state 2>/dev/null)
+            case "$R" in *binder=*) VR_STATE=1 ;; esac
+            if [ "$VR_STATE" != "1" ] && [ "$STATE_RETRY" -lt 3 ]; then
+                STATE_RETRY=$((STATE_RETRY + 1))
+                am force-stop com.huawei.hvrsdkserverapp 2>/dev/null
+                am start-service -n com.huawei.hvrsdkserverapp/com.huawei.hvrsdkserverapp.service.ArvrRuntimeService 2>/dev/null
+                echo "$(date) vr_system_state 未发布 → 重启 Runtime 重发（第 $STATE_RETRY 次）" >> "$LOG"
+                sleep 3
+                R=$(timeout 5 content call \
+                      --uri content://com.huawei.vrlauncherx.registry \
+                      --method getService --arg vr_system_state 2>/dev/null)
+                case "$R" in *binder=*) VR_STATE=1 ;; esac
+            fi
+            if [ "$VR_STATE" = "1" ]; then
+                if am start -n com.huawei.vrlauncherx/.MainActivity >/dev/null 2>&1; then
+                    GLASS_LAUNCH_DONE=1
+                    echo "$(date) 眼镜在位 → vr_system_state OK → 已拉起 VR 桌面" >> "$LOG"
+                fi
+            elif [ "$STATE_RETRY" -ge 3 ]; then
+                # 三次仍不发布：放行一次并写 WARN，避免「什么都不发生」
                 GLASS_LAUNCH_DONE=1
-                echo "$(date) 眼镜在位 → 已拉起 VR 桌面" >> "$LOG"
+                echo "$(date) [WARN] vr_system_state 始终未发布，仍尝试拉起桌面（预期 SDK Quit）" >> "$LOG"
+                am start -n com.huawei.vrlauncherx/.MainActivity >/dev/null 2>&1
             fi
         fi
         GLASS_WAS=1
@@ -150,6 +202,36 @@ while true; do
         fi
         GLASS_WAS=0
         GLASS_LAUNCH_DONE=0
+        STATE_RETRY=0
+    fi
+
+    # --- vr_system_state 周期巡检（2026-11-08「打开应用就退出」补的缺口）---
+    # 桌面 Unity 在 onPause 时会 finish all activity + ForceProcessExit，
+    # 把 launcherx 进程连同注册表（进程内 static Map）一起杀掉。实测
+    # 03:27:29 onPause → 03:27:29 ForceProcessExit → "has died: fg TOP"，
+    # 触发点甚至可以是启动另一个 Activity / 投屏的 MediaProjection 授权框。
+    # HvrStatePublisher 只在 Runtime handshake 时发一次，桌面死了不会补发；
+    # 原实现只在「首次拉桌面」时查一次，之后注册表长期为 null → 回不去桌面。
+    # 这里每 15 秒查一次，缺失就重启 Runtime 重发（同一故障 60 秒内只修一次，
+    # 避免桌面反复自杀时把 Runtime 也拖进重启震荡）。
+    # 注意：只修 binder，不强行把桌面拉回前台——用户可能正在用投屏等 2D 应用。
+    NOW=$(date +%s)
+    if [ $((NOW - STATE_LAST_CHECK)) -ge 15 ]; then
+        STATE_LAST_CHECK=$NOW
+        R=$(timeout 5 content call \
+              --uri content://com.huawei.vrlauncherx.registry \
+              --method getService --arg vr_system_state 2>/dev/null)
+        case "$R" in
+            *binder=*) ;;
+            *)
+                if [ $((NOW - STATE_REPAIR_LAST)) -ge 60 ]; then
+                    STATE_REPAIR_LAST=$NOW
+                    am force-stop com.huawei.hvrsdkserverapp 2>/dev/null
+                    am start-service -n com.huawei.hvrsdkserverapp/com.huawei.hvrsdkserverapp.service.ArvrRuntimeService 2>/dev/null
+                    echo "$(date) [巡检] vr_system_state 丢失 → 重启 Runtime 重发" >> "$LOG"
+                fi
+                ;;
+        esac
     fi
 
     # --- /dev/ttyUSB* vcom 节点（2026-11-06 新增，受开关控制）---

@@ -330,6 +330,9 @@ cp -f  /data/local/tmp/hvrfix/magisk-module/runtime/light-on.sh     /data/adb/hv
 cp -f  /data/local/tmp/hvrfix/magisk-module/modules/resolution_white.xml /data/adb/hvrglass/resolution_white.xml
 [ -f /data/adb/hvrglass/mode ] || echo auto > /data/adb/hvrglass/mode
 chmod 755 /data/adb/modules/hvrglass /data/adb/modules/hvrglass/post-fs-data.sh /data/adb/modules/hvrglass/service.sh /data/adb/hvrglass/edid-mode.sh /data/adb/hvrglass/light-on.sh
+# --- 控制接口协议探测二进制（service.sh 用它真发 HIDIOCGFEATURE(4) 挑接口；
+#     2026-11-08 修判据后必须有，否则会退化为按描述符长度兜底）---
+chmod 755 /data/adb/modules/hvrglass/hwvr-probe
 chmod 644 /data/adb/modules/hvrglass/module.prop /data/adb/modules/hvrglass/common/edid_only.bin /data/adb/hvrglass/edid_1080p.bin /data/adb/hvrglass/resolution_white.xml /data/adb/hvrglass/mode" >/dev/null 2>&1
 
 # --- 可选 system overlay（public.libraries.txt 替换 + libc_secshared.so）---

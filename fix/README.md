@@ -123,6 +123,8 @@
 | `light-on.sh` / `一键点亮.bat` | **一键点亮眼镜**（本地入口，自动 push 设备端脚本） | — |
 | `adb-keepalive.sh` / `adb-keepalive-daemon.sh` | 无线 adb 5555 运行时守护；`on/off/check`。**已非必需**（2026-11-07 起 ADB 自恢复内嵌在设备端点亮脚本里），保留作可选冗余 | nohup 后台进程（重启失效） |
 | `ttyusb-compat.sh` | vcom (`/dev/ttyUSB*`) 运行时绑定 + 权限校正；`check/on/off/watch` | 运行时 sysfs（重启失效） |
+| `tools/hwvr1-check.sh` | **两道闸一键体检**（hidraw 枚举 + `hwvr-probe` 应答 + `hwvr1` 指向 + `vr_system_state` 注册表 + 失败计数），只读 | — |
+| `magisk-module/modules/hwvr-probe` | 控制接口协议探测二进制（`HIDIOCGFEATURE(4)`，源码 `ksu/hwvr_compat/hwvr-probe.c`） | `/data/adb/modules/hvrglass/hwvr-probe` |
 | `ddc-passthrough.sh` | DDC / EDID 直通验证；`check/passthrough/restore/reboot/verify` | `/data/adb/hvrglass/mode` |
 | `restart-hwc.sh` | HWC 选模取证；`check/restart/verify`（**勿当点亮手段**，restart 实测整机重启且无效） | — |
 | `一键修复VR框架.sh` / `一键修复VR框架.bat` | **修 VR 桌面链路**（装四个最终补丁 → 开模拟辅助显示 → 启 `.MainActivity`；`check/off/rollback/launcher`） | 手册第 8 章 |
@@ -499,11 +501,24 @@ sh fix/patches/vrdesktop/apply_landscape_patch.sh [serial]
 `active device(2) OK` 出不来 —— **HDMI 有时序但眼镜面板不亮**。
 现象就是「Android 主屏截图有 VR 画面，眼镜里却什么都没有」。
 
-`magisk-module/modules/service.sh` 现在按 **HID 报告描述符前 3 字节
-`06 ff 00`** 找控制接口并自动纠正 `/dev/hwvr1`（不依赖编号、不写死
-VID/PID）。实测故意指错后 1 秒内自动改回。
-注：`ksu/hwvr_compat/hwvr-probe` 的 `GET_FEATURE(4)` 在本机 hidraw0/1
-都返回 0，区分不了，所以用描述符。
+> **⚠️ 2026-11-08 修正：上面「前 3 字节 `06 ff 00` 即可识别」的表述不准确。**
+> 真机枚举发现 **CV10 与控制口的前 3 字节完全相同**，只靠前缀会稳定选错
+> （详见第十一章）。当前 `service.sh` 的判据已改为：
+
+```sh
+# 1) 候选仍限定 `06ff00`（排除 05 0c 按键口 / 05 01 Hub）
+# 2) 用 hwvr-probe 真发 HIDIOCGFEATURE(4) 验协议应答：控制口 rc=0、CV10 rc=4
+# 3) 没有 probe 二进制时退化为「描述符实际字节数最大者」（28B vs 68B）
+```
+
+`hwvr-probe` 源码在 `ksu/hwvr_compat/hwvr-probe.c`，编译产物随模块部署到
+`/data/adb/modules/hvrglass/hwvr-probe`（install.sh 自动 chmod 755）。
+旧注释里「`GET_FEATURE(4)` 在本机 hidraw0/1 都返回 0，区分不了」是误读：
+**0 是进程退出码**（`ioctl` 返回 4 字节 = 成功），不是 ioctl 返回值。
+另注意 sysfs 的 `stat -c %s report_descriptor` 恒为 4096，比长度必须用
+`od -An -tx1 -v ... | wc -w` 读实际字节数。
+
+一键体检：`sh fix/tools/hwvr1-check.sh [serial]`（只读，同时查两道闸）。
 
 ### 8.2 模拟辅助屏窗口叠影 → 左眼画面错乱
 
@@ -700,11 +715,14 @@ HomeScene。想恢复引导改回 1 即可。
 
 ### 10.3 插入眼镜自动启动桌面
 
-`magisk-module/modules/service.sh` 主循环里加状态机：控制接口（描述符
-`06 ff 00`）从不在位变在位 → 稳定 8 秒且 VRService 已在跑 → `am start`
+`magisk-module/modules/service.sh` 主循环里加状态机：控制接口（**协议探测
+`hwvr-probe rc=0` + 描述符 `06 ff 00`**，见 8.1 修正）从不在位变在位 →
+稳定 8 秒且 VRService 已在跑 → **先确认 `vr_system_state` 已发布**（缺失则
+`force-stop` 并重启 `ArvrRuntimeService` 让它重发，最多 3 次）→ 再 `am start`
 一次 `com.huawei.vrlauncherx/.MainActivity`；拔出复位，重插再拉。
 开机时眼镜已插着也覆盖。日志在 `/data/local/tmp/hidraw_perm.log`
-（"眼镜在位 → 已拉起 VR 桌面"）。
+（"眼镜在位 → vr_system_state OK → 已拉起 VR 桌面"）。
+加第二道闸的原因见第十一章：不查就直接拉桌面会 `CheckVrMode` SDK Quit。
 
 ### 10.4 验收
 
@@ -723,3 +741,152 @@ SurfaceView 缓冲队列打废（logcat 每帧 `requestBuffer failed BAD_VALUE`�
 眼镜面板 ACTIVE 但全黑。修法：点亮后 `am force-stop com.huawei.vrlauncherx`
 再 `am start`，Unity 重建 surface 即恢复（实测闭环）。所以正确顺序是
 **先点亮、再（重）启桌面**——守护脚本的自动拉起已天然满足（开机顺序）。
+
+---
+
+## 十一、两道软件闸：桌面起不来 / 眼镜黑屏（2026-11-08 真机复核）
+
+> 完整取证链见 `fix/2026-11-08-眼镜黑屏排查分析.md` 第七、八章，日志
+> `build/tmp/analysis-1108-*.log`。**本章结论推翻第四章「MCU 卡死、需拔插
+> USB」的旧判断**。
+
+### 11.1 「拔了又插眼镜还是黑屏」的答案
+
+拔插**不解决问题**，因为根因在软件：`service.sh` 每 3 秒重跑一次错误的
+选点判据，每次拔插都把 `/dev/hwvr1` 重新指回 CV10。现场
+`/data/local/tmp/hidraw_perm.log` 记录了拔插当刻：
+
+```
+03:08:15  hwvr1 清除（控制接口不在位）
+03:08:18  hwvr1 -> /dev/hidraw0 (control iface)   ← 拔插后立刻又指错
+```
+
+### 11.2 闸 1：`/dev/hwvr1` 指向 CV10 而非控制口
+
+| 节点 | HID_ID | 描述符前 3B | 实际长度 | report 1 | `hwvr-probe` |
+|---|---|---|---|---|---|
+| `hidraw0` | `12d1:1092` CV10 | `06 ff 00` | 28 B | **1 B** | `rc=4` 失败 |
+| `hidraw1` | `12d1:107e` input3（控制口） | `06 ff 00` | 68 B | **59 B IMU**，另有 feature id4 = 127 B | `rc=0` 成功 |
+
+`docs/HELMET_HID_PROTOCOL.md` 定死 `ioGetVendorInfo()` = `HIDIOCGFEATURE(4)`、
+`buf[0]=1`，发到只有 1 字节 report 1 的 CV10 必然失败。旧判据
+「前缀 `06ff00` + `break` 取第一个」永远选中 hidraw0。后果：
+
+```
+E DevHid: ioGetVendorInfo failed, ret(-1)
+E DMManager: dev WalleDev open error → loadDevLibs WalleAlg error
+I Unity_HVRRenderMgrCore: OnApplicationQuit()
+```
+
+且 `active device(2) OK` 一次都不出现 —— 激活命令发不出去，**面板不亮**。
+`vendorId=0` 是失败结果（`WalleCommon::mVendor` 进程内缓存），不是原因，
+也不是 MCU 卡死。停掉 vrhandle 的实验已排除「hidraw 进程竞争」。
+
+### 11.3 闸 2：`vr_system_state` binder 未发布
+
+修好闸 1 后 Unity 仍退出：
+
+```
+W HvrSdkBridge: vr_system_state binder not published yet
+I UnityPlugin: CheckVrMode, is not VRMode, exit
+E Unity_HVRRenderMgrCore: CheckVRMode FAIL, SDK Quit
+```
+
+注册表 `VrSystemRegistryProvider` 是 **launcherx 进程内的 static Map**，
+`force-stop` 桌面 / 拔插引起的进程重建会清空它；`HvrStatePublisher` 只在
+`ArvrRuntimeService` 启动握手时发布一次，不会补发。实测查询：
+
+```sh
+adb shell content call --uri content://com.huawei.vrlauncherx.registry \
+  --method getService --arg vr_system_state
+# Result: null                     ← 未发布（闸 2 未通过）
+# Result: Bundle[{binder=...}]     ← 已发布
+```
+
+实验 D（先重启 `ArvrRuntimeService` → 再启动桌面）20 秒窗口内
+`OnApplicationQuit=0`、栈顶稳定 `.MainActivity`，反向印证两道闸。
+
+### 11.4 已固化到工具链的改动
+
+| 文件 | 改动 |
+|---|---|
+| `magisk-module/modules/service.sh` | 选点改为「`06ff00` 候选 + `hwvr-probe` 协议应答优先 + 描述符长度兜底」，去掉 `break`；拉桌面之前查 `vr_system_state`，缺失则重启 Runtime 重发（最多 3 次） |
+| `magisk-module/modules/hwvr-probe` | 新增（从 `ksu/hwvr_compat/` 复制随模块部署） |
+| `install.sh` | step 2 增加 `chmod 755 hwvr-probe` |
+| `patches/vrdesktop/fix_battery_noop.py` | 补写（此前只在分析文档里被引用、未落盘）；幂等 no-op 化 `processBattery` 的 below-5 / below-20 两分支，已在两种 smali 变体上验证 |
+| `patches/vrdesktop/apply_monitor_patch.sh` | 6 步 → 7 步，把 battery no-op 并入一键重打包 |
+| `tools/hwvr1-check.sh` | 新增只读体检脚本，一次查完两道闸 |
+
+### 11.5 验收
+
+```sh
+# 只读体检（两道闸都应 [OK]）
+sh fix/tools/hwvr1-check.sh 192.168.43.133:5555
+
+# 守护改链接记录应出现新的判据标记
+adb shell su -c 'grep "probe+rank" /data/local/tmp/hidraw_perm.log | tail -3'
+
+# 桌面启动链：无 ioGetVendorInfo failed、无 OnApplicationQuit
+adb shell logcat -c
+adb shell am start -n com.huawei.vrlauncherx/.MainActivity
+adb shell logcat -d | grep -E 'ioGetVendorInfo|dev_open|OnApplicationQuit|CheckVrMode|active device'
+```
+
+**不再需要**：物理拔插眼镜 USB、MCU 断电复位、USB `unbind`/`bind` 自动重枚举。
+
+### 11.6 「VR 桌面里打开应用就退出」/「长按主页键回不去」
+
+实测时间线（`build/tmp/analysis-1108-openapp.log`，设备 03:27:17–03:27:46）：
+
+```
+03:27:17  am start 桌面             → Displayed +4s794ms
+03:27:27  START com.sparkfox.sportsdeviceserver/.ActivityToStartService（包已不存在）
+03:27:29  HwVrLauncherX_MainActivity: onPause
+          → Unity OnApplicationQuit → HVR_ShutdownRenderThread
+          → HvrFramework::Deinit → VrFramework: finish all activity
+          → ForceProcessExit → "Process com.huawei.vrlauncherx has died: fg TOP"
+03:27:31  am start 投屏 Vr2dStartUpActivity → HvrMirrorActivity
+          → com.android.systemui/.media.MediaProjectionPermissionActivity（2D 授权框）
+03:27:32  VrSystemActor.refresh(displayAdded) → HvrStatePublisher: published vr_system_state: true
+03:27:33  VRService 重拉 VRPrepareActivity → 03:27:40 重新 Displayed MainActivity
+03:27:46  CheckVRMode PASS（这次才真正进 VR 模式）
+```
+
+四条结论：
+
+1. **桌面不是退到后台，是被 SDK 主动杀进程**。`onPause` → `finish all activity` →
+   `ForceProcessExit` 是 HVR 原厂「单 VR 应用独占」设计；任何抢焦点操作
+   （启动别的 Activity、系统权限框、Home 键）都会触发。桌面自杀甚至发生在
+   **启动投屏之前**，所以「打开应用才退出」是表象。
+2. **投屏最容易触发**：免 root 实现 `HvrMirrorActivity` 首次会弹
+   `MediaProjectionPermissionActivity`（2D 系统界面），必然把桌面挤到 onPause。
+3. 桌面进程一死，`VrSystemRegistryProvider`（进程内 static Map）随之清空，
+   `vr_system_state` 回到 `Result: null`；`HvrStatePublisher` 只在 Runtime
+   handshake 时发一次，不会补发 → 重新 `am start` 也会 `CheckVrMode` SDK Quit。
+   **守护已补 15 秒周期巡检 + 60 秒限频重发**（见 11.4），只修 binder、
+   不强行把桌面拉回前台，避免打断正在用的投屏。
+4. **长按 Home 本来就不是回桌面**：原厂语义是「单击 <1s → 进 VRLauncher，
+   长按 ≥1s → 视点重置」（`docs/reference/vr-engine/00-索引与对移植的意义.md` 1.3）。
+   且桌面进程已被杀，按键事件落在当前 2D 焦点窗口，根本没有可返回的 VR 桌面。
+
+回桌面（短按 Home <1s，或命令行）：
+
+```sh
+adb shell content call --uri content://com.huawei.vrlauncherx.registry \
+  --method getService --arg vr_system_state   # 应为 Bundle[{binder=...}]，null 就等守护巡检
+adb shell am start -n com.huawei.vrlauncherx/.MainActivity
+```
+
+要根治二选一：① 按 `docs/CAST_NOROOT.md` 第 5 步**预先完成 MediaProjection
+授权**，让投屏不再弹 2D 授权框；② 改 launcherx 的 Unity 退出策略，让
+`onPause` 走后台而不是 `ForceProcessExit`（需改 SDK/Assembly-CSharp，风险高，
+未做）。
+
+### 11.7 USB 重枚举瞬态不是故障
+
+眼镜会自行掉线重枚举（`USB disconnect` → `Added device`，实测 03:23:51 /
+03:24:01 / 03:25:13 各一次），期间 hidraw 节点重建、编号可能整体漂移，
+`report_descriptor` 会短暂读成空 —— 此刻 `hwvr1-check.sh` 会误报 FAIL，
+**等 3~10 秒重跑即可**。守护的判据不依赖编号：重枚举后真控制口从
+`hidraw1` 变成 `hidraw0`，日志仍记录 `probe+rank=10068` 并正确跟随。
+USB 重枚举会连带清空注册表，11.4 的周期巡检同时覆盖这一场景。
