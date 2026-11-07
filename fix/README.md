@@ -556,7 +556,8 @@ ReconnectController: not connected to any device, skip
 - 用 vrhandle 自带的 BLE 扫描管理器 `t0/y0`（`R()` 自初始化单例），
   把 Service 已有的 `m` 字段（`VRHandleService$d` implements
   `BluetoothDeviceDiscoverCallback`）传给 `N(Lp0/c)` 启动扫描；
-- 扫到设备后**原厂链路**走 `N2(BluetoothDevice)` 入库并连接，不需要配对页 UI；
+- 扫描回调里注入 `onDeviceFound`（见 9.5 第 3 层），纯后台完成
+  连接 + 入库，不需要配对页 UI；
 - **60 秒节流**：冷启动安排一次，之后 20 秒心跳每次检查，手柄晚开机 /
   休眠唤醒后下一轮自动被扫到；
 - **延迟 3 秒**（`Handler.postDelayed`）：扫描必须晚于 `startForeground()`。
@@ -588,56 +589,69 @@ Android build-tools 34。设备上已是补丁版时，用
 让开机立即扫（不用等首轮 20 秒心跳）；`install.sh` 的两处补拉也同步加了。
 `grant-vr-perms.sh` 补三个定位/扫描 appops 与 `deviceidle` 白名单。
 
-### 9.5 ⚠️ 系统硬限制：后台 Service 扫描拿不到结果
+### 9.5 纯后台方案（2026-11-07 最终打通）
 
-这是本轮最重要的结论，**不要据此声称「已能自动连接」**：
+排障过程钉死了三层问题，逐层解决后**全自动、零 UI**：
+
+1. **扫描时序**：扫描早于 `startForeground()` 会被蓝牙栈判后台，
+   `Permission denial: Need ACCESS_FINE_LOCATION permission to get scan
+   results`、`Total number of results: 0`。修法：`postDelayed(3s)`
+   等前台通知起来再扫。
+2. **「仅在使用期间允许」**：即使 pm granted=true，UID 级 appops
+   `COARSE_LOCATION: foreground` 是系统按可见性动态给的，
+   `appops set/reset/--uid` 都改不掉；可见 Activity 时拒绝消失，
+   前台服务不够。**修法（纯后台关键）**：apktool 重编 Manifest，
+   声明 `ACCESS_BACKGROUND_LOCATION`（原包没声明，`pm grant` 直接
+   SecurityException），装好后 root `pm grant` 授「始终允许」，
+   后台扫描立刻拿到结果。脚本 7/9 步自动完成，节点数 54→55，
+   其余 863 条目逐字节保留。
+3. **原厂入库链路断点**：扫到设备后 `N2 → v.w(DeviceInfo) →
+   BluetoothManager.T0`，而 T0 要求的回调 `a$g` 只在配对页
+   `ScanningFragment` 里经 `t0/i.q()` 注册 —— 纯后台恒为 null，
+   设备被静默丢弃，`processDeviceDiscovered` 刷屏但永远不入库。
+   **修法**：在扫描回调 `VRHandleService$d.a()` 里注入
+   `AutoScanCompat.onDeviceFound(device)`：
+   - `BluetoothManager.a1(DeviceInfo)` = 复刻「配对页点击连接」，
+     经 vrservice 发起 GATT；
+   - `VrSdkApi.h2(DeviceInfo)` = 入库 + 持久化到
+     `shared_prefs/sp_device_storage`（注意 h2 的落盘 r2 只认
+     `DeviceConnectState == 2`，须先 setDeviceConnectState(2)；
+     真连接成功后原厂 `i2 → h2` 再入库，H0 去重幂等）；
+   - 60 秒同址节流（扫描期间同一手柄每 ~500ms 广播一次）。
+
+**实测结果（设备 Android 11 / vrhandle targetSdk=31）**：
 
 ```
-E BluetoothUtils: Permission denial: Need ACCESS_FINE_LOCATION permission to get scan results
-dumpsys bluetooth_manager → com.huawei.vrhandle
-    LE scans (started/stopped): 48 / 48
-    Total number of results   : 0        ← 扫了 48 次，一个结果都没有
+AutoScanCompat: device found: HUAWEI CF20_45AB -> connect + persist
+vrhandle_BluetoothManager: processDeviceConnectionStateChange, deviceState = 2
+vrhandle_VrDeviceService: isWriteDescriptorSuccess = true
+VrSdkApi: mDeviceInfoList size = 1
+VrHandleReconnectController: device is already connected
+bluetooth_manager: 00:39:34.399 CONNECTED f7:2d:dd:63:45:ab
+shared_prefs/sp_device_storage.xml:
+  F7:2D:DD:63:45:AB {mDeviceName:"HUAWEI CF20_45AB", mDeviceConnectState:2, ...}
 ```
 
-`pm` 里 `ACCESS_FINE_LOCATION granted=true`、`location_mode=3`、
-package 级 `appops` 全部 `allow`，但 `cmd appops get --uid 10075`
-显示 **UID 级 `COARSE_LOCATION: foreground`** —— 系统按「仅在使用期间允许」
-动态给出，`appops set` / `reset` / `--uid` 都改不掉（shell 的 MODE 只有
-allow/ignore/deny/default，没有 foreground）。
-
-实测对照：
-
-| 场景 | `Permission denial` | 扫描结果 |
-|---|---|---|
-| 后台 Service（含前台服务 + 延迟 3 秒） | 每次扫描 1 条 | 0 |
-| `am start -n com.huawei.vrhandle/.MainActivity`（可见 Activity） | **0 条** | 0（当时手柄未在广播） |
-
-即：**需要可见 Activity 级前台**才能通过定位检查。前台服务不够。
-另外手柄 CF20 静置会休眠、或已连到别的设备，此时附近没有 BLE 广播，
-`Total number of results` 同样是 0 —— 两个条件要同时满足。
-
-**当前可行的完整路径**：首次让 `com.huawei.vrhandle/.MainActivity`
-在前台完成一次扫描入库（之后 `mDeviceInfoList size` 变 1、
-`shared_prefs` 写入 MAC）；**入库之后每次开机**走原有 20 秒重连心跳即可
-自动连接，不再需要扫描、不再需要 UI。是否把「开机自动拉起一次前台配对页」
-写进工具，需要用户确认（会短暂在眼镜里显示 2D 配对界面）。
+入库持久化之后，**每次开机**由 20 秒 RECONNECT 心跳直接重连，
+不需要扫描、不需要任何 UI；手柄没电/晚开机也只需下一次扫描窗口。
 
 ### 9.6 验收命令
 
 ```sh
-# 补丁在跑
+# 补丁在跑 + 扫到设备
 adb shell logcat -d | grep AutoScanCompat
 #   kick: schedule BLE scan after foreground +3s
 #   run: auto BLE scan (foreground ready)
-adb shell logcat -d | grep VrDeviceManager      # enter discover / startScan
+#   device found: HUAWEI CF20_45AB -> connect + persist   ← 关键行
 
-# 是否真拿到结果（比日志更可靠）
-adb shell dumpsys bluetooth_manager | grep -A8 com.huawei.vrhandle
-#   看 Total number of results / Last 5 scans
+# 连接状态
+adb shell logcat -d | grep -E 'deviceState = 2|mDeviceInfoList size|already connected'
+adb shell dumpsys bluetooth_manager | grep -i 'CONNECTED\|f7:2d'   # MAC 各机不同
 
-# 是否已入库并连接
-adb shell logcat -d | grep -E 'mDeviceInfoList size|CF20|connectGatt'
-adb shell dumpsys bluetooth_manager | grep -i 'Bonded devices'
+# 入库持久化
+adb shell su -c 'cat /data/data/com.huawei.vrhandle/shared_prefs/sp_device_storage.xml'
 ```
 
 手柄没广播时按一下电源键唤醒、别让它连着别的设备，下一轮 60 秒内会自动扫到。
+回退：`adb install -r build/tmp/autoscan/base.apk`（回退后删掉
+`shared_prefs/sp_device_storage.xml` 即完全恢复原厂行为）。

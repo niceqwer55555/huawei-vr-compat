@@ -62,13 +62,13 @@ set_op com.huawei.vrlauncherx GET_USAGE_STATS
 # Android 11 的「仅前台允许定位」会拦掉扫描结果，日志表现为
 #   E BluetoothUtils: Permission denial: Need ACCESS_FINE_LOCATION permission
 # 即使 pm 里 granted=true，appops 仍可能停在 foreground/有 rejectTime。
-# 三个 op 都要显式 allow —— 这是必要条件，但还不足够：
+# 三个 op 都要显式 allow —— 但仍不足够：
 #   cmd appops get --uid <uid> 显示 UID 级 COARSE_LOCATION: foreground，
 #   appops set / reset / --uid 都改不掉（系统按「仅在使用期间允许」动态给）。
-#   实测后台 Service 扫描会打权限拒绝、AppScanStats Total results=0；
-#   把 com.huawei.vrhandle/.MainActivity 拉到前台时拒绝消失。
-# 所以首次入库仍需要一次前台配对页；入库之后 20 秒重连心跳即可自动连接，
-# 不再需要扫描。详见 README 第九节。
+# 纯后台正解：给 vrhandle 打 Manifest 补丁声明 ACCESS_BACKGROUND_LOCATION
+# （fix/patches/vrdesktop/apply_autoscan_patch.sh 第 7/9 步），
+# 然后在本脚本 pm grant 授「始终允许」，后台扫描即放行，无需前台 UI。
+# 详见 README 第九节。
 for op in android:fine_location android:coarse_location android:bluetooth_scan; do
     set_op com.huawei.vrhandle "$op"
 done
@@ -83,6 +83,9 @@ grant com.huawei.vrlauncherx android.permission.ACCESS_FINE_LOCATION
 grant com.huawei.vrlauncherx android.permission.ACCESS_COARSE_LOCATION
 grant com.huawei.vrhandle android.permission.ACCESS_FINE_LOCATION
 grant com.huawei.vrhandle android.permission.ACCESS_COARSE_LOCATION
+# 需要补丁版 Manifest 声明（见 apply_autoscan_patch.sh 7/9 步）；
+# 原包未声明时这行会 failed，无害。
+grant com.huawei.vrhandle android.permission.ACCESS_BACKGROUND_LOCATION
 grant com.huawei.appmarket.vr android.permission.READ_PHONE_STATE
 grant com.huawei.vrservice android.permission.WRITE_SECURE_SETTINGS
 

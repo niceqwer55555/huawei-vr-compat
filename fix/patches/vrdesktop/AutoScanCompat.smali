@@ -5,6 +5,8 @@
 
 
 # static fields
+.field private static sLastAddr:Ljava/lang/String;
+.field private static sLastFoundMs:J
 .field private static sLastKickMs:J
 
 # instance fields
@@ -105,8 +107,7 @@
 # t0/y0 是 vrhandle 自带的扫描管理器（R() 自初始化单例，构造函数从
 # VrHandleApplication 取 Context 与 BluetoothAdapter）；N(Lp0/c) 即
 # startScan；回调用 Service 已构造好的 m 字段（VRHandleService$d
-# implements BluetoothDeviceDiscoverCallback），扫到设备后原链路走
-# N2(BluetoothDevice) 入库并连接，不需要配对页 UI。
+# implements BluetoothDeviceDiscoverCallback）。
 .method public run()V
     .registers 3
 
@@ -129,6 +130,138 @@
     :try_end_0
     .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0
 
+    return-void
+
+    :catch_0
+    move-exception v0
+
+    return-void
+.end method
+
+
+# 由 VRHandleService$d.a(BluetoothDevice) 调用（扫描回调）：
+# 纯后台复刻「配对页点击连接」，并把手柄入库，之后每次开机由
+# 20 秒 RECONNECT 心跳自动重连，不再依赖任何 UI。
+#
+# 原厂链路断点（2026-11-07 逆向确认）：
+#   N2(BluetoothDevice) -> v.w(DeviceInfo) -> BluetoothManager.T0()
+#   T0 要求回调 a$g 非空 —— 而它只在配对页 ScanningFragment 里经
+#   t0/i.q() 注册，纯后台恒为 null，扫到的设备被静默丢弃。
+#
+# 补法（对应配对页行为）：
+#   1. BluetoothManager.a1(DeviceInfo)  = 配对页点击设备后的连接入口
+#      -> d1() -> e.f(mac) 让 vrservice 发起 GATT 连接；
+#   2. VrSdkApi.h2(DeviceInfo) = 入库 + l2() 持久化到
+#      shared_prefs/sp_device_storage，之后心跳 getUsedDeviceList
+#      就能拿到设备、开机自动重连。
+#      注意 h2 的异步落盘 r2() 只在 DeviceConnectState == 2 时持久化
+#      （原厂语义：连接成功才入库），所以先 setDeviceConnectState(2)。
+#      a1 连接成功后原厂 i2() -> h2() 会再次入库，幂等（H0 去重）。
+#
+# 60 秒同址节流：扫描期间同一手柄每 ~500ms 广播一次，不节流会反复
+# 调 a1/h2。全程 try/catch，绝不影响 Service 原有流程。
+.method public static onDeviceFound(Landroid/bluetooth/BluetoothDevice;)V
+    .registers 7
+
+    :try_start_0
+    if-eqz p0, :ret
+
+    invoke-virtual {p0}, Landroid/bluetooth/BluetoothDevice;->getAddress()Ljava/lang/String;
+
+    move-result-object v0
+
+    if-eqz v0, :ret
+
+    invoke-virtual {p0}, Landroid/bluetooth/BluetoothDevice;->getName()Ljava/lang/String;
+
+    move-result-object v1
+
+    if-eqz v1, :ret
+
+    invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
+
+    move-result-wide v2
+
+    sget-wide v4, Lcom/huawei/vrhandle/AutoScanCompat;->sLastFoundMs:J
+
+    sub-long/2addr v2, v4
+
+    const-wide/32 v4, 0xea60
+
+    cmp-long v6, v2, v4
+
+    if-gez v6, :fresh
+
+    sget-object v6, Lcom/huawei/vrhandle/AutoScanCompat;->sLastAddr:Ljava/lang/String;
+
+    if-eqz v6, :fresh
+
+    invoke-virtual {v6, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v6
+
+    if-eqz v6, :fresh
+
+    return-void
+
+    :fresh
+    invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
+
+    move-result-wide v2
+
+    sput-wide v2, Lcom/huawei/vrhandle/AutoScanCompat;->sLastFoundMs:J
+
+    sput-object v0, Lcom/huawei/vrhandle/AutoScanCompat;->sLastAddr:Ljava/lang/String;
+
+    const-string v2, "AutoScanCompat"
+
+    new-instance v3, Ljava/lang/StringBuilder;
+
+    invoke-direct {v3}, Ljava/lang/StringBuilder;-><init>()V
+
+    const-string v4, "device found: "
+
+    invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v3, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    const-string v4, " -> connect + persist"
+
+    invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v3}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+
+    move-result-object v3
+
+    invoke-static {v2, v3}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+
+    new-instance v2, Lcom/huawei/vrhandle/datatype/DeviceInfo;
+
+    invoke-direct {v2}, Lcom/huawei/vrhandle/datatype/DeviceInfo;-><init>()V
+
+    invoke-virtual {v2, v0}, Lcom/huawei/vrhandle/datatype/DeviceInfo;->setDeviceIdentify(Ljava/lang/String;)V
+
+    invoke-virtual {v2, v1}, Lcom/huawei/vrhandle/datatype/DeviceInfo;->setDeviceName(Ljava/lang/String;)V
+
+    const/4 v3, 0x2
+
+    invoke-virtual {v2, v3}, Lcom/huawei/vrhandle/datatype/DeviceInfo;->setDeviceConnectState(I)V
+
+    invoke-static {}, Lcom/huawei/vrhandle/a;->m1()Lcom/huawei/vrhandle/a;
+
+    move-result-object v3
+
+    invoke-virtual {v3, v2}, Lcom/huawei/vrhandle/a;->a1(Lcom/huawei/vrhandle/datatype/DeviceInfo;)V
+
+    invoke-static {}, Lt0/l8;->N0()Lt0/l8;
+
+    move-result-object v3
+
+    invoke-virtual {v3, v2}, Lt0/l8;->h2(Lcom/huawei/vrhandle/datatype/DeviceInfo;)V
+    :try_end_0
+    .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0
+
+    :ret
     return-void
 
     :catch_0

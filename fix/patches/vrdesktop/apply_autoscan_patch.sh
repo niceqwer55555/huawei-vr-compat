@@ -27,19 +27,28 @@
 #   60 秒节流 + 全程 try/catch：每次 RECONNECT 心跳都会检查，手柄晚开机、
 #   休眠唤醒后会在下一轮被扫到，且绝不影响 Service 原有流程。
 #
+# Manifest 补丁（纯后台的关键，2026-11-07 决定性实验后加入）：
+#   设备 Android 11（SDK 30）+ vrhandle targetSdk=31。后台 Service
+#   扫描被「仅在使用期间允许」的定位授权拦截，UID 级 appops
+#   COARSE_LOCATION 恒为 foreground，set/reset/--uid 都改不掉；
+#   对照实验：可见 Activity 时拒绝 0 条，前台服务（延后 3s）仍全拒。
+#   targetSdk=31 在 R 上的唯一纯后台解法是「始终允许」定位 =
+#   Manifest 声明 ACCESS_BACKGROUND_LOCATION + root pm grant。
+#   原包没声明，pm grant 直接 SecurityException。所以流程里用
+#   apktool 重编 Manifest（只加一条 uses-permission，节点数 54→55），
+#   编译产物只取 AndroidManifest.xml 塞回 APK，其余条目逐字节保留。
+#   replace_manifest.py 会校验新串池里确有该权限（UTF-16LE）。
+#
 #   开机链路（无需额外守护）：hvrglass/service.sh 在 boot_completed 后
 #   拉起 ArvrRuntimeService → VrSystemActor 20 秒心跳 → VRHandleService
 #   onStartCommand → kick。service.sh 另补一条显式 start，让开机立即扫，
 #   不用等首轮心跳。
 #
-# 权限前提（否则扫描注册成功但拿不到结果）：
+# 权限前提（安装后自动补）：
 #   E BluetoothUtils: Permission denial: Need ACCESS_FINE_LOCATION ...
-#   即使 pm granted=true，appops 仍可能停在 foreground / 有 rejectTime。
-#   必须三个 op 都 allow，见 fix/tools/grant-vr-perms.sh：
-#     appops set com.huawei.vrhandle android:fine_location allow
-#     appops set com.huawei.vrhandle android:coarse_location allow
-#     appops set com.huawei.vrhandle android:bluetooth_scan allow
-#   本脚本安装后会顺手补一遍。
+#   appops fine/coarse_location 显式 allow + bluetooth_scan allow +
+#   ACCESS_BACKGROUND_LOCATION（Manifest 已声明，见上）pm grant，
+#   见 fix/tools/grant-vr-perms.sh。本脚本安装后会顺手补一遍。
 #
 # 依赖：python3、baksmali-fat.jar / smali-fat.jar、java（JRE 17）、
 #       Android build-tools 的 zipalign/apksigner.jar、
@@ -87,7 +96,7 @@ BT="${BUILD_TOOLS:-D:/Tools/AndroidSDK/build-tools/34.0.0}"
 [ -x "$BT/zipalign.exe" ] || { echo "[FATAL] zipalign 不存在：$BT"; exit 1; }
 [ -f "$BT/lib/apksigner.jar" ] || { echo "[FATAL] apksigner.jar 不存在：$BT"; exit 1; }
 [ -f "$KEYSTORE" ] || { echo "[FATAL] 签名密钥不存在：$KEYSTORE"; exit 1; }
-for j in baksmali-fat.jar smali-fat.jar; do
+for j in baksmali-fat.jar smali-fat.jar apktool_2.10.0.jar; do
     [ -f "$ROOT/tools/$j" ] || { echo "[FATAL] 缺少 $ROOT/tools/$j"; exit 1; }
 done
 
@@ -97,7 +106,7 @@ mkdir -p "$OUT/smali"
 
 step() { echo; echo "===== $* ====="; }
 
-step "1/8 连接设备并确定原包（回退底本）"
+step "1/9 连接设备并确定原包（回退底本）"
 "$ADB" connect "$SERIAL" >/dev/null 2>&1
 P=$("$ADB" -s "$SERIAL" shell "pm path com.huawei.vrhandle" | tr -d '\r' | sed 's/^package://')
 [ -n "$P" ] || { echo "[FATAL] 设备上没有 com.huawei.vrhandle"; exit 1; }
@@ -112,7 +121,7 @@ else
 fi
 echo "  原 APK: $(stat -c %s "$OUT/base.apk") B（回退底本）"
 
-step "2/8 提取 dex 并定位含 VRHandleService 的那个"
+step "2/9 提取 dex 并定位含 VRHandleService 的那个"
 python3 - "$OUT/base.apk" "$OUT" <<'PY'
 import sys, zipfile
 from pathlib import Path
@@ -127,7 +136,7 @@ PY
 DEXCOUNT=$(wc -l < "$OUT/dexlist.txt" | tr -d ' ')
 echo "  共 $DEXCOUNT 个 dex"
 
-step "3/8 baksmali 反编译（逐 dex 独立目录）"
+step "3/9 baksmali 反编译（逐 dex 独立目录）"
 while IFS= read -r d; do
     [ -n "$d" ] || continue
     # 目录名直接用 dex 条目名（如 classes.dex），不再二次拼后缀，
@@ -151,20 +160,33 @@ DEXNAME="$(basename "$SMALIDIR")"
 echo "  目标 smali 目录: $SMALIDIR"
 echo "  对应 dex 条目  : $DEXNAME"
 
-step "4/8 注入 AutoScanCompat + 两处 kick 调用"
+step "4/9 注入 AutoScanCompat + 两处 kick 调用"
 python3 "$PATCHDIR/inject_autoscan.py" "$SMALIDIR" "$PATCHDIR/AutoScanCompat.smali"
 
-step "5/8 smali 回编译 dex"
+step "5/9 smali 回编译 dex"
 "$JAVA" -jar "$ROOT/tools/smali-fat.jar" a "$SMALIDIR" \
     -o "$OUT/$DEXNAME.new" 2>&1 | tail -5
 echo "  新 dex: $(stat -c %s "$OUT/$DEXNAME.new") B"
 
-step "6/8 替换 dex（其余 APK 条目逐字节保留）"
+step "6/9 替换 dex（其余 APK 条目逐字节保留）"
 python3 "$PATCHDIR/replace_dex.py" "$OUT/base.apk" "$DEXNAME" \
     "$OUT/$DEXNAME.new" "$OUT/unsigned.apk"
 
-step "7/8 zipalign + apksigner v1/v2 重签 + 证书一致性校验"
-"$BT/zipalign.exe" -p -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
+step "7/9 Manifest 补丁：声明 ACCESS_BACKGROUND_LOCATION（纯后台扫描关键）"
+rm -rf "$OUT/mnf"
+"$JAVA" -jar "$ROOT/tools/apktool_2.10.0.jar" d -f -s -o "$OUT/mnf" \
+    "$OUT/base.apk" 2>&1 | tail -1
+python3 "$PATCHDIR/patch_manifest_bgloc.py" "$OUT/mnf"
+"$JAVA" -jar "$ROOT/tools/apktool_2.10.0.jar" b "$OUT/mnf" \
+    -o "$OUT/mnf/built.apk" 2>&1 | tail -1
+# 只取编译产物里的二进制 AndroidManifest.xml（解到独立文件名，别覆盖
+# mnf/AndroidManifest.xml 源文本，否则下次重编会把二进制当源）。
+unzip -p "$OUT/mnf/built.apk" AndroidManifest.xml > "$OUT/manifest_bgloc.axml"
+python3 "$PATCHDIR/replace_manifest.py" "$OUT/unsigned.apk" \
+    "$OUT/manifest_bgloc.axml" "$OUT/unsigned2.apk"
+
+step "8/9 zipalign + apksigner v1/v2 重签 + 证书一致性校验"
+"$BT/zipalign.exe" -p -f 4 "$OUT/unsigned2.apk" "$OUT/aligned.apk"
 "$JAVA" -jar "$BT/lib/apksigner.jar" sign \
     --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
     --v1-signing-enabled true --v2-signing-enabled true \
@@ -184,11 +206,11 @@ print(f'  新 APK {sys.argv[2]}: {len(b)} B  '
 assert b'AutoScanCompat' in b, '补丁类没进 dex'
 PY
 
-step "8/8 安装 + 补 BLE 扫描授权 + 冷启动触发扫描"
+step "9/9 安装 + 补 BLE 扫描授权 + 冷启动触发扫描"
 "$ADB" -s "$SERIAL" push "$OUT/autoscan-signed.apk" \
     /data/local/tmp/vrh-autoscan.apk 2>&1 | tail -1
 "$ADB" -s "$SERIAL" shell "pm install -r /data/local/tmp/vrh-autoscan.apk" 2>&1 | tr -d '\r'
-"$ADB" -s "$SERIAL" shell "su -c 'pm grant com.huawei.vrhandle android.permission.ACCESS_FINE_LOCATION; pm grant com.huawei.vrhandle android.permission.ACCESS_COARSE_LOCATION; appops set com.huawei.vrhandle android:fine_location allow; appops set com.huawei.vrhandle android:coarse_location allow; appops set com.huawei.vrhandle android:bluetooth_scan allow; cmd deviceidle whitelist +com.huawei.vrhandle'" >/dev/null 2>&1
+"$ADB" -s "$SERIAL" shell "su -c 'pm grant com.huawei.vrhandle android.permission.ACCESS_FINE_LOCATION; pm grant com.huawei.vrhandle android.permission.ACCESS_COARSE_LOCATION; pm grant com.huawei.vrhandle android.permission.ACCESS_BACKGROUND_LOCATION; appops set com.huawei.vrhandle android:fine_location allow; appops set com.huawei.vrhandle android:coarse_location allow; appops set com.huawei.vrhandle android:bluetooth_scan allow; cmd deviceidle whitelist +com.huawei.vrhandle'" >/dev/null 2>&1
 # 清缓冲，避免把上一次扫描的历史日志当成本次验收结果。
 "$ADB" -s "$SERIAL" shell "logcat -c; am force-stop com.huawei.vrhandle; sleep 2; am start-foreground-service -n com.huawei.vrhandle/.service.VRHandleService -a com.huawei.vrservice.ACTION_RECONNECT_MSG" >/dev/null 2>&1
 sleep 22
