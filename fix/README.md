@@ -1108,11 +1108,16 @@ VR 桌面是 Unity 3D 场景，2D 应用不会因为「进程起来了」就自�
   panel-bootstrap 让启动方自己建屏，桌面自己拉起的应用不需要该模块。）
 
 **`overlay_display_devices` 的取舍**：反编译 `vrvirtualscreen` 的
-`HvrMirrorService.showMirror()` 确认，双目镜像屏尺寸按
-`scale = min((副屏宽/2)/1920, 副屏高/1080)`、`eye = round(主屏尺寸 × scale)`
-从副屏推导。当前 `100x100/320` → 每眼 **50×28**，与实测完全吻合，历史日志
-`mirror overlay shown on display 1 (Overlay #1) 100x100, eye 50x28` 也是这个值。
-手册 7.4 的成功态是 `1920x1080/320` + 608×1080 双目虚拟屏。
+`HvrMirrorService.showMirror()` 确认，双目镜像屏从副屏推导：
+`eyeWidth = panelWidth/2`、`eyeHeight = panelHeight`，手机画面按
+`scale = min(eyeWidth/phoneW, eyeHeight/phoneH)` 缩放后居中。
+当前 `100x100/320` → 每眼格子 **50×100**，历史日志里的
+`mirror overlay shown on display 1 (Overlay #1) 100x100, eye 50x28` 中 `50×28`
+是按手机 16:9 比例缩放后的**画面内容**尺寸（不是每眼格子），二者不矛盾。
+
+> 2026-11-26 口径修正：眼镜物理面板 3200×1600（2:1），SBS 每眼 **1600×1600（1:1 正方形）**。
+> 早期"每眼 960×540 / 608×1080""手册 7.4 成功态 1920×1080"是把 overlay 副屏误当物理面板、
+> 又按手机 16:9 缩放推出的旧口径，已废止。承载面板应设横屏 `3200x1600/320`。
 100×100 是第九章为了消除左眼叠影特地压小的（辅助屏是主屏缩小镜像、会递归叠影），
 **副作用就是把 SBS 投屏面板一起压成空壳**。两个目标冲突，需二选一或分离职责
 （小屏只做在位判据、另建独立大屏做面板）。
@@ -1216,16 +1221,17 @@ dumpsys window displays: Display: mDisplayId=4 stacks=0
 不默认改设备：
 
 ```sh
-sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 show     # 现状 + 每眼推算
-sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 panel    # 1920x1080/320 → 每眼 608x1080
-sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 dual     # 100x100 + 1920x1080 两块
+sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 show     # 现状 + 每眼口径
+sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 panel    # 3200x1600/320 → 每眼 1600x1600（正方形，与物理面板 1:1）
+sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 dual     # 100x100 + 3200x1600 两块
 sh fix/tools/vr-overlay-mode.sh 192.168.43.133:5555 restore  # 回滚（修改前自动备份）
 ```
 
-`100x100/320` → 每眼 50×28，SBS 面板是空壳；调大可能重新引入第九章的左眼
-叠影，所以两者是取舍。`dual` 目前只分离出两块屏，**尚未**让大屏被选中：
-`VrPlatformCompat.externalDisplay()` 和 `HvrMirrorService` 的
-`HvrPanelFinder` 都取第一块非默认 display，需要另 patch 按面积优先。
+`100x100/320` → 每眼 50×100，SBS 面板是空壳；承载面板应设 `3200x1600/320`
+（眼镜物理面板 2:1，SBS 每眼 1600×1600 正方形，与物理面板 1:1 不变形），
+调大可能重新引入第九章的左眼叠影，所以两者是取舍。`dual` 分离出两块屏后，
+`VrPlatformCompat.externalDisplay()` 和 `HvrMirrorService` 的 `HvrPanelFinder`
+已由 2026-11-26 修复改为按面积优先选中 3200×1600 大屏（见 `docs/SBS-PANEL-FIX.md`）。
 改 overlay 会触发 DisplayManager 重建副屏 → Presentation dismiss → 虚拟屏
 释放，需重启 VR 桌面让 panel-bootstrap 重建。
 

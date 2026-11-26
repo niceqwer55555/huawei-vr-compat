@@ -22,6 +22,12 @@
 
 > 你前面问的"投屏从中间被拆成两份"是 **SBS 帧的结构**（左右眼并排），
 > 两条路线送到眼镜的那一刻都要满足这个结构，区别只在于画面从哪来。
+>
+> **单眼规格 = 1600×1600（1:1 正方形）**：眼镜物理面板 3200×1600（2:1 横屏），
+> 左右各占一半。因此承载 SBS 的 overlay 面板必须设成横屏 **3200×1600**，
+> `HvrMirrorService` 的 `eyeWidth=panelWidth/2, eyeHeight=panelHeight` 才会得到
+> 每眼 1600×1600，合成到物理面板时 1:1 对齐。旧口径"每眼 960×540 / 608×1080"
+> 是把 1920×1080 的 overlay 副屏误当成物理面板尺寸，已废弃（2026-11-26）。
 
 ---
 
@@ -30,7 +36,7 @@
 | # | 条件 | 检查命令 | 通过标准 |
 |---|---|---|---|
 | 1 | APK 含 2026-11-26 面积选大屏修复 | `grep -a 'largestDisplay' <设备上vrservice.apk抽出classes4.dex>` 或看换芯脚本日志 | 出现 `largestDisplay` / `isCandidatePanel` |
-| 2 | overlay 设为 dual 档 | `sh fix/tools/vr-overlay-mode.sh <serial> show` | `overlay_display_devices = 100x100/320;1920x1080/320`，提示"按面积选 1920x1080" |
+| 2 | overlay 设为 dual 档 | `sh fix/tools/vr-overlay-mode.sh <serial> show` | `overlay_display_devices = 100x100/320;3200x1600/320`，提示"按面积选 3200x1600 → 每眼 1600×1600" |
 | 3 | 眼镜在位 | 同上 show | `hidraw>=1`、`/dev/hwvr1=yes`；`hwvr1-check.sh` probe 应答正常 |
 | 4 | 强制横屏已开 | `settings get system accelerometer_rotation` / `user_rotation` | `0` / `1`（ROTATION_90），见 `PATCH_AUDIT.md` §11.5 |
 | 5 | 三段式第②环建屏 | `sh fix/tools/vr-display-check.sh <serial>` 看 A 段 | `HUAWEI VR Display = 1 块`，3200×1600，owner=vrlauncherx |
@@ -73,8 +79,8 @@ sh fix/tools/vr-display-check.sh <serial>  # A~G 七段
 
 - `hwvr1-check.sh`：`ioGetVendorInfo` 失败 0 次，`vendorId=4817(0x12D1)`；
 - `vr-display-check.sh` A 段：`HUAWEI VR Display = 1`（3200×1600）；
-- C 段：按面积选 1920×1080、每眼约 960×540；
-- G 段：`HvrVrPanel: panel presentation shown on display N` 且 N = 1920×1080 那块的 id。
+- C 段：按面积选 3200×1600、每眼 1600×1600（1:1 正方形，与物理面板对齐）；
+- G 段：`HvrVrPanel: panel presentation shown on display N` 且 N = 3200×1600 那块的 id。
 
 > G 段第 4 条是**本次修复的直接验收点**：Presentation 必须挂在大屏 id，不是 100×100 小屏。
 
@@ -105,7 +111,8 @@ adb -s <serial> shell dumpsys SurfaceFlinger | grep -A3 'HUAWEIAV03\|HUAWEI VR D
 
 | 症状 | 最可能原因 | 查哪里 |
 |---|---|---|
-| 切 dual 后仍是 50×28 空壳 | APK 没换芯（第 1 条没满足） | 回 §1.1、`SBS-PANEL-FIX-BUILD.md` |
+| 切 dual 后仍是 100×100 小屏/空壳 | APK 没换芯（第 1 条没满足） | 回 §1.1、`SBS-PANEL-FIX-BUILD.md` |
+| 每眼画幅是 16:9 而非 1600×1600 正方形 | overlay 大屏档用了旧值 1920x1080 | 用 `vr-overlay-mode.sh panel|dual` 切到 3200x1600 |
 | `panel presentation shown on display` 挂到小屏 id | 面板选择补丁没进这份 dex | `SBS-PANEL-FIX.md` §2，重编 dex |
 | G 段 `HvrVrPanel = 0`，① 从未挂 | panel-bootstrap 没预建屏 | `fix/README.md` §11.13 |
 | 应用仍落在 `displayId=0` 主屏 | `setLaunchDisplayId` 路由失败 / 跨进程被拦 | `vr-display-check.sh` D 段、`fix/README.md` §11.12 |

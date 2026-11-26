@@ -124,7 +124,7 @@ public final class VrPlatformCompat {
      * own it would also match the cover panel of a folded phone.
      *
      * <p><b>2026-11-26 修复：</b>当 {@code overlay_display_devices} 配成两块副屏
-     * （dual 档：{@code 100x100/320;1920x1080/320}）时，旧的「返回第一块非默认亮屏」
+     * （dual 档：{@code 100x100/320;3200x1600/320}）时，旧的「返回第一块非默认亮屏」
      * 会选中 100x100 的探针屏，Presentation 随之挂到它上面，真正承载 SBS
      * 双目的大屏成了空壳。现在改为在所有合格副屏里按**可视面积最大**选择；面积
      * 相同时按 displayId 稳定取小的一个。{@link #hasExternalDisplay(Context)} 的

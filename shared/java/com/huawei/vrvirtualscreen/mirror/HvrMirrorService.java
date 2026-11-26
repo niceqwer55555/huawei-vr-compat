@@ -42,9 +42,15 @@ import java.util.List;
  *     -> MediaProjection.createVirtualDisplay(AUTO_MIRROR, 眼睛那一路 Surface)
  *     -> SurfaceView 在眼镜 display 上显示
  *
- * 华为 VR Glass 的面板是一块 3200x1600 的横屏，左右两半分别是左右眼。这里按
- * 「左右各一份手机画面」摆放，各自建一条 MediaProjection 虚拟屏，保持手机屏幕
- * 的比例居中，避免把竖屏画面横向拉满。
+ * 华为 VR Glass 的面板是一块 3200x1600 的横屏（2:1），左右两半分别是左右眼，
+ * 即每眼 1600x1600 的 1:1 正方形面板。承载 SBS 的 overlay 副屏必须设成横屏
+ * 3200x1600，{@code eyeWidth = panelWidth / 2, eyeHeight = panelHeight} 才会得到
+ * 每眼 1600x1600、合成到物理面板时 1:1 不变形（旧口径把副屏设成 1920x1080，
+ * 每眼 960x1080 会被横向拉伸，2026-11-26 修正）。
+ *
+ * 这里按「左右各一份手机画面」摆放，各自建一条 MediaProjection 虚拟屏，保持手机屏幕
+ * 的比例居中（letterbox），避免把竖屏画面横向拉满——这是每眼正方形格子里放
+ * 16:9 画面的正确做法，不是把格子本身改成 16:9。
  *
  * 只依赖 `SYSTEM_ALERT_WINDOW`（安装脚本的 appops，或设置里手动给「显示在其他
  * 应用上层」）；不需要 root / LSPosed，也不需要华为 VR 系统服务。

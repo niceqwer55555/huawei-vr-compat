@@ -43,21 +43,24 @@ sh_shell 'dumpsys window displays | grep -E "^ *Display: mDisplayId=|mCurrentFoc
 echo "--- 当前栈顶 ---"
 sh_shell 'dumpsys activity activities | grep mResumedActivity | head -1'
 
-say "C. overlay_display_devices 与每眼尺寸推算"
+say "C. overlay_display_devices 与 SBS 每眼尺寸（物理面板 3200x1600 → 每眼 1600x1600）"
 OVR=$(sh_shell 'settings get global overlay_display_devices')
 echo "    overlay_display_devices = ${OVR:-（未设置）}"
-echo "    HvrMirrorService 公式: scale = min((面板宽/2)/1920, 面板高/1080)"
-echo "                           eye = (round(1920*scale), round(1080*scale))"
-echo "    2026-11-26 起按可视面积最大选面板（dual 档选 1920x1080，不再是第一块 100x100）"
+echo "    眼镜物理面板 = 3200x1600（2:1 横屏），SBS 左右并排 → 每眼 1600x1600（1:1 正方形）。"
+echo "    HvrMirrorService: eyeWidth = panelWidth/2, eyeHeight = panelHeight；"
+echo "      手机画面按 min(eyeW/phoneW, eyeH/phoneH) 缩放后居中放进每眼（letterbox）。"
+echo "    2026-11-26 起按可视面积最大选面板（dual 档选 3200x1600 大屏，不再退回第一块 100x100）。"
 printf '%s' "${OVR:-0x0}" | tr ';' '\n' | awk -F'[/x]' '
     $1+0>0 && $2+0>0 { a=$1*$2; if (a>best) { best=a; bw=$1+0; bh=$2+0 } }
     END {
-        if (best<=0) { printf "    无有效副屏 → 每眼约 0x0\n"; exit }
-        s=(bw/2)/1920; t=bh/1080; if (t<s) s=t
-        printf "    按面积选 %dx%d → 每眼约 %dx%d\n", bw, bh, int(1920*s+0.5), int(1080*s+0.5)
+        if (best<=0) { printf "    无有效副屏 → 每眼 0x0\n"; exit }
+        if (bw==3200 && bh==1600) note="与物理面板 1:1，正确"
+        else note="非 3200x1600，合成到眼镜会被拉伸/变形"
+        printf "    按面积选 %dx%d 面板 → 每眼 %dx%d（%s）\n", bw, bh, int(bw/2), bh, note
     }'
-echo "    （手册 7.4 成功态：overlay=1920x1080/320，双目虚拟屏 608x1080；"
-echo "      dual=100x100/320;1920x1080/320 时按面积选中大屏，每眼约 960x540）"
+echo "    目标态：承载面板 3200x1600 → 每眼 1600x1600 正方形；"
+echo "      旧口径 1920x1080 → 每眼 960x1080（16:9），再按手机比例缩放成 960x540 属误导，"
+echo "      正方形面板被塞进 16:9 会在合成到眼镜时被横向拉伸。"
 
 say "D. 显示路由日志（当前 logcat 缓冲区）"
 for k in "HvrDisplayRouter: HUAWEI VR Display not up yet" "vr activity routed to display" "HvrVrPanel" "mirror overlay shown on display" "HvrDisplayRouting"; do
@@ -114,7 +117,7 @@ else
         echo "      HvrVrPanel: failed / no external panel yet 的具体报错。"
     fi
 fi
-echo "  副屏尺寸档位（100x100 会把 SBS 面板压成 50x28 空壳）："
+echo "  副屏尺寸档位（承载面板应设 3200x1600 → 每眼 1600x1600；100x100 会压成 50x100 空壳）："
 echo "    sh fix/tools/vr-overlay-mode.sh $SERIAL show|panel|dual|restore"
 echo "  注意：应用本身通常是好的（am start 能起来并驻留），「没显示」是显示承载链的问题。"
 echo "  应急直接开应用：sh fix/tools/open-vr-app.sh $SERIAL alvr"

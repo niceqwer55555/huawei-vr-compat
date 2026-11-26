@@ -269,7 +269,11 @@ case "$ACTION" in
         install_apk com.youku.vr "$Y" || exit 1
         sleep 4
         echo "[6/11] 打开模拟辅助显示 + 恢复 vcom（头盔在位判定前提）..."
-        "$ADB" -s "$SERIAL" shell "settings put global overlay_display_devices 1920x1080/320"
+        # 眼镜物理面板 3200x1600（2:1），SBS 左右各半 → 每眼 1600x1600（正方形）。
+        # 承载面板设成横屏 3200x1600，HvrMirrorService 的 eyeWidth=panelWidth/2、
+        # eyeHeight=panelHeight 才会得到每眼 1600x1600，合成到物理面板 1:1 不变形。
+        # 旧值 1920x1080/320 会得到每眼 960x1080（16:9），合成时被横向拉伸（2026-11-26 修正）。
+        "$ADB" -s "$SERIAL" shell "settings put global overlay_display_devices 3200x1600/320"
         # /dev/ttyUSB* 缺失 → UpgradeGlass 打不开 vcom → proximity=-1 →
         # t0/c.P(I) 不启动 3D 桌面。运行时绑定 usbserial_generic + chmod 666，
         # 重启即失效、off 可立即回退（fix/ttyusb-compat.sh，2026-11-06 实测）。

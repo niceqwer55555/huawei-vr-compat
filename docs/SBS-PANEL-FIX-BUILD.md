@@ -56,9 +56,11 @@ sh tools/build-compat-dex.sh
 > `VrSystemActor` 等系统侧类与本修复无关，不要拿它去换 vrservice。
 >
 > 全量编译验证（2026-11-26）：stubs 9 类、通用 81 类、Runtime 92 类均编译通过；
-> 通用 dex sha256 = `bb5fbfd59150c14357b766b7f0693e20872ef83c51bca962407ba2ed566e2e85`，
-> 与已落盘 `compat-sbs-panel-fix.dex` 逐字节一致；两种 dex 均完成换芯→对齐→签名→验签
-> 端到端验证，其余 613 条目逐字节不变。
+> 通用 dex sha256 = `fdf11bfbe126108ff3559251ac56933b4c7af2ae346f4768cd5f4d0e7a242e6c`
+> （2026-11-26 SBS 单眼口径修正后重编；连续两次编译字节一致），与已落盘
+> `compat-sbs-panel-fix.dex` 逐字节一致；两种 dex 均完成换芯→对齐→签名→验签
+> 端到端验证，其余 613 条目逐字节不变。若换芯脚本报告 sha 不同，以设备端
+> 校验修复类/方法存在为准（D8 版本差异会让字节不同，不影响修复逻辑）。
 
 ## 4. 换芯到设备（核心）
 
@@ -93,8 +95,9 @@ adb -s <serial> shell logcat -d | grep -E 'panel by|panel presentation shown|Hvr
 adb -s <serial> shell dumpsys display | grep -i 'HUAWEI VR Display'
 ```
 
-期望日志关键字：`panel by presentation category: #N ... 1920x1080` 或
-`panel presentation shown on display N`，N 对应大屏 id；`HUAWEI VR Display` 尺寸不再是 50×28。
+期望日志关键字：`panel by presentation category: #N ... 3200x1600` 或
+`panel presentation shown on display N`，N 对应 3200×1600 大屏 id；`HUAWEI VR Display`
+尺寸不再是 100×100；每眼 SurfaceView = 1600×1600（正方形，与物理面板 1:1）。
 
 ## 6. 边界
 
