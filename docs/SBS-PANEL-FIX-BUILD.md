@@ -44,6 +44,22 @@ sh tools/build-compat-dex.sh
 该脚本 = `build-module.ps1` 的"编译 stubs → 编译 shared/java → d8"三步的 Linux 版，
 **已随本次修复编译好**，正常情况下无需重跑；只有再次改动 `shared/java` 时才需要。
 
+> **两种 compat dex 的区别（全量编译已验证，别混用）**：
+>
+> | dex | 源码 | 大小 | 打包进 |
+> |---|---|---|---|
+> | 通用 | `shared/java`（65 源 → 81 类） | ~94 KB | 除 Runtime 外的包（含 vrservice / vrvirtualscreen / vrlauncherx） |
+> | Runtime 专用 | 上面 + `shared/runtime-actor/java`（+4 源 → 92 类） | ~106 KB | **只** `com.huawei.hvrsdkserverapp` |
+>
+> 本次 SBS 面板修复的类（`VrPlatformCompat` / `HvrPanelFinder`）都在**通用** dex 里，
+> 所以 `build-compat-dex.sh` 只产通用 dex 就够了。Runtime 专用 dex 多出的
+> `VrSystemActor` 等系统侧类与本修复无关，不要拿它去换 vrservice。
+>
+> 全量编译验证（2026-11-26）：stubs 9 类、通用 81 类、Runtime 92 类均编译通过；
+> 通用 dex sha256 = `bb5fbfd59150c14357b766b7f0693e20872ef83c51bca962407ba2ed566e2e85`，
+> 与已落盘 `compat-sbs-panel-fix.dex` 逐字节一致；两种 dex 均完成换芯→对齐→签名→验签
+> 端到端验证，其余 613 条目逐字节不变。
+
 ## 4. 换芯到设备（核心）
 
 前提：设备上已装**打过 compat 补丁**的 APK（含 `VrPlatformCompat` 类的那份 dex）。
