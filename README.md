@@ -176,3 +176,7 @@ adb push build/hwvr_compat.zip /data/local/tmp/hwvr_compat.zip
   落地：[`docs/SBS-PANEL-FIX-BUILD.md`](docs/SBS-PANEL-FIX-BUILD.md) —— 用
   `build/compat-dex/compat-sbs-panel-fix.dex` + `tools/apply-sbs-panel-fix.sh`
   换芯注入，无需重编整包。
+- **SBS 显示验收手册**：[`docs/SBS-VERIFY.md`](docs/SBS-VERIFY.md)
+  —— 把"怎样算成功、怎么验、失败怎么定位"收成一条操作链：两条路线区分、前置条件打勾、
+  换芯切档命令、三级判据（脚本逻辑 / dumpsys 几何 / 真机肉眼）、症状定位表。
+  注：最终视觉结果必须真机肉眼确认，截图在这台机器上不可信。

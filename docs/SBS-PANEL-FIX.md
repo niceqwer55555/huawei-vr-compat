@@ -7,6 +7,10 @@
 > **怎么装到设备上**：见 [`docs/SBS-PANEL-FIX-BUILD.md`](SBS-PANEL-FIX-BUILD.md)。
 > 兼容层已编译成 `build/compat-dex/compat-sbs-panel-fix.dex`，用
 > `tools/apply-sbs-panel-fix.sh` 换进设备上已打补丁的 APK 即可生效，无需重编整包。
+>
+> **怎么验收是否成功**：见 [`docs/SBS-VERIFY.md`](SBS-VERIFY.md)（三级判据 + 症状定位表）。
+> 本修复的直接验收点是日志 `panel presentation shown on display N` 中 N 为 1920×1080
+> 大屏的 id，而非 100×100 小屏。
 
 ## 1. 问题
 

@@ -46,13 +46,18 @@ sh_shell 'dumpsys activity activities | grep mResumedActivity | head -1'
 say "C. overlay_display_devices 与每眼尺寸推算"
 OVR=$(sh_shell 'settings get global overlay_display_devices')
 echo "    overlay_display_devices = ${OVR:-（未设置）}"
-echo "    HvrMirrorService 公式: scale = min((副屏宽/2)/1920, 副屏高/1080)"
+echo "    HvrMirrorService 公式: scale = min((面板宽/2)/1920, 面板高/1080)"
 echo "                           eye = (round(1920*scale), round(1080*scale))"
-W=$(echo "${OVR:-0x0}" | cut -d/ -f1 | cut -dx -f1)
-H=$(echo "${OVR:-0x0}" | cut -d/ -f1 | cut -dx -f2)
-echo "${W:-0} ${H:-0}" | awk '{ w=$1; h=$2; s=(w/2)/1920; t=h/1080; if(t<s)s=t; printf "    副屏 %dx%d → 每眼约 %dx%d\n",w,h,int(1920*s+0.5),int(1080*s+0.5) }'
+echo "    2026-11-26 起按可视面积最大选面板（dual 档选 1920x1080，不再是第一块 100x100）"
+printf '%s' "${OVR:-0x0}" | tr ';' '\n' | awk -F'[/x]' '
+    $1+0>0 && $2+0>0 { a=$1*$2; if (a>best) { best=a; bw=$1+0; bh=$2+0 } }
+    END {
+        if (best<=0) { printf "    无有效副屏 → 每眼约 0x0\n"; exit }
+        s=(bw/2)/1920; t=bh/1080; if (t<s) s=t
+        printf "    按面积选 %dx%d → 每眼约 %dx%d\n", bw, bh, int(1920*s+0.5), int(1080*s+0.5)
+    }'
 echo "    （手册 7.4 成功态：overlay=1920x1080/320，双目虚拟屏 608x1080；"
-echo "      100x100/320 是后来为消除左眼叠影压小的，副作用是把面板压成空壳）"
+echo "      dual=100x100/320;1920x1080/320 时按面积选中大屏，每眼约 960x540）"
 
 say "D. 显示路由日志（当前 logcat 缓冲区）"
 for k in "HvrDisplayRouter: HUAWEI VR Display not up yet" "vr activity routed to display" "HvrVrPanel" "mirror overlay shown on display" "HvrDisplayRouting"; do

@@ -43,11 +43,17 @@ sh_shell() { MSYS2_ARG_CONV_EXCL='*' "$ADB" -s "$SERIAL" shell "$1" 2>/dev/null 
 cur() { sh_shell "settings get global $KEY"; }
 
 eye_of() {
-    # $1 = WxH/DPI[,;...]；只按第一块算（HvrMirrorService 找的是第一块副屏）
-    first=$(printf '%s' "$1" | cut -d';' -f1 | cut -d/ -f1)
-    w=$(printf '%s' "$first" | cut -dx -f1)
-    h=$(printf '%s' "$first" | cut -dx -f2)
-    printf '%s %s' "${w:-0}" "${h:-0}" | awk '{ w=$1+0; h=$2+0; s=(w/2)/1920; t=h/1080; if(t<s)s=t; printf "每眼约 %dx%d", int(1920*s+0.5), int(1080*s+0.5) }'
+    # $1 = WxH/DPI[;WxH/DPI...]
+    # 2026-11-26 起 HvrPanelFinder/VrPlatformCompat.largestDisplay 按「可视面积最大」
+    # 选面板，dual 档(100x100;1920x1080)实际选 1920x1080 大屏，不再是第一块小屏。
+    # 这里同步为「按面积最大那块」估算，否则诊断会把大屏误报成每眼 50x28 空壳。
+    printf '%s' "$1" | tr ';' '\n' | awk -F'[/x]' '
+        $1+0>0 && $2+0>0 { a=$1*$2; if (a>best) { best=a; bw=$1+0; bh=$2+0 } }
+        END {
+            if (best<=0) { printf "每眼约 0x0（无有效副屏）"; exit }
+            s=(bw/2)/1920; t=bh/1080; if (t<s) s=t
+            printf "按面积选 %dx%d → 每眼约 %dx%d", bw, bh, int(1920*s+0.5), int(1080*s+0.5)
+        }'
 }
 
 show() {
