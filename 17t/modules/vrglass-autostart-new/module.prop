@@ -1,0 +1,6 @@
+id=vrglass-autostart-new
+name=VR Glass Auto Start (new system line)
+version=v1.0
+versionCode=1
+author=hvr-compat
+description=Auto-launch the Huawei VR 3D desktop on glasses plug-in (USB 12d1:107e + HDMI display). Calls the existing start_vr_desktop.sh. Edge-triggered, no so/dex changes.
