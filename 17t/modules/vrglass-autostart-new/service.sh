@@ -88,6 +88,17 @@ log "=== autostart daemon up (cooldown=${COOLDOWN}s) ==="
           # 同步执行：脚本内部会 force-stop 整条链再拉起，需等它跑完(~40s)
           sh "$START" >> "$LOG" 2>&1
           log "start_vr_desktop.sh returned"
+          # 桌面起来后默认打开原版 ALVR 串流（可选：删掉下面 launch_alvr.sh 即禁用）
+          if [ -f "$MODDIR/launch_alvr.sh" ]; then
+            sleep 10
+            # ALVR 启动会切走桌面 -> 刷新 LAST 防止守护把这次切换误判为"桌面掉了"
+            # 而在 cooldown 内重复拉桌面(否则会形成 桌面->ALVR->桌面 循环)。
+            echo "$(date +%s 2>/dev/null || echo 0)" > "$LAST"
+            log "launching ALVR after desktop"
+            sh "$MODDIR/launch_alvr.sh" >> "$LOG" 2>&1
+            log "launch_alvr.sh returned"
+            echo "$(date +%s 2>/dev/null || echo 0)" > "$LAST"
+          fi
         else
           log "ERROR: $START missing"
         fi
