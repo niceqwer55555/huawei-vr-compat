@@ -90,8 +90,12 @@ sh fix/tools/vr-display-check.sh <serial>  # A~G 七段
 adb -s <serial> shell dumpsys SurfaceFlinger | grep -A3 'HUAWEIAV03\|HUAWEI VR Display'
 ```
 
-看 VR 空间那层的 bounds：横屏应为 `3200x1600` 量级、`scale` 接近 1（2640×1.2121≈3200），
+看 VR 空间那层的 bounds：横屏应为 `3200x1600` 量级、`scale` 接近 1（每眼 1600×1600），
 不再是竖屏 `1600x3200` + 139px 偏移（`PATCH_AUDIT.md` §11.4/§11.5）。
+
+> 当前高通适配把手机逻辑尺寸设成 `1600x3200`，转横屏即 3200x1600，与物理面板
+> 1:1，`scale = 1`。旧记录里的 `2640×1.2121≈3200` 是 1080x2640 手机逻辑尺寸时代
+> 把画面放大铺满面板宽的写法，现已不适用（`PATCH_AUDIT.md` §11.4）。
 
 ### 3.3 视觉成功（**必须真机肉眼**）
 
