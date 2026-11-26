@@ -39,7 +39,7 @@ export ADB=/path/to/platform-tools/adb
 
 ```bash
 sh tools/build-compat-dex.sh
-# 产物：build/compat-dex/compat-sbs-panel-fix.dex（约 94 KB，含 largestDisplay 修复）
+# 产物：build/compat-dex/compat-sbs-panel-fix.dex（约 101 KB，含 largestDisplay 修复 + 单路 GL 双画）
 ```
 该脚本 = `build-module.ps1` 的"编译 stubs → 编译 shared/java → d8"三步的 Linux 版，
 **已随本次修复编译好**，正常情况下无需重跑；只有再次改动 `shared/java` 时才需要。
@@ -48,19 +48,21 @@ sh tools/build-compat-dex.sh
 >
 > | dex | 源码 | 大小 | 打包进 |
 > |---|---|---|---|
-> | 通用 | `shared/java`（65 源 → 81 类） | ~94 KB | 除 Runtime 外的包（含 vrservice / vrvirtualscreen / vrlauncherx） |
-> | Runtime 专用 | 上面 + `shared/runtime-actor/java`（+4 源 → 92 类） | ~106 KB | **只** `com.huawei.hvrsdkserverapp` |
+> | 通用 | `shared/java`（66 源 → 86 类） | ~101 KB | 除 Runtime 外的包（含 vrservice / vrvirtualscreen / vrlauncherx） |
+> | Runtime 专用 | 上面 + `shared/runtime-actor/java`（+4 源 → 97 类） | ~113 KB | **只** `com.huawei.hvrsdkserverapp` |
 >
-> 本次 SBS 面板修复的类（`VrPlatformCompat` / `HvrPanelFinder`）都在**通用** dex 里，
+> 本次修复的类（`VrPlatformCompat` / `HvrPanelFinder` 面板按面积；
+> `HvrMirrorService` / `HvrMirrorGlView` 单路 GL 双画）都在**通用** dex 里，
 > 所以 `build-compat-dex.sh` 只产通用 dex 就够了。Runtime 专用 dex 多出的
 > `VrSystemActor` 等系统侧类与本修复无关，不要拿它去换 vrservice。
 >
-> 全量编译验证（2026-11-26）：stubs 9 类、通用 81 类、Runtime 92 类均编译通过；
-> 通用 dex sha256 = `fdf11bfbe126108ff3559251ac56933b4c7af2ae346f4768cd5f4d0e7a242e6c`
-> （2026-11-26 SBS 单眼口径修正后重编；连续两次编译字节一致），与已落盘
-> `compat-sbs-panel-fix.dex` 逐字节一致；两种 dex 均完成换芯→对齐→签名→验签
-> 端到端验证，其余 613 条目逐字节不变。若换芯脚本报告 sha 不同，以设备端
-> 校验修复类/方法存在为准（D8 版本差异会让字节不同，不影响修复逻辑）。
+> 全量编译验证（2026-11-26）：stubs 9 类、通用 86 类、Runtime 97 类均编译通过；
+> 通用 dex sha256 = `91719256a4ea90713557c0d8c7ee8eeb4de8f8e2dd45d7749832db9784cef4b9`
+> （2026-11-26 单路 GL 双画改造后重编；连续两次编译字节一致），与已落盘
+> `compat-sbs-panel-fix.dex` 逐字节一致；已用本地底本完成换芯→对齐→签名→验签
+> 端到端验证，其余 613 条目逐字节不变（目标 `classes4.dex` 95998→103416 B）。
+> 若换芯脚本报告 sha 不同，以设备端校验修复类/方法存在为准（D8 版本差异会让
+> 字节不同，不影响修复逻辑）。
 
 ## 4. 换芯到设备（核心）
 

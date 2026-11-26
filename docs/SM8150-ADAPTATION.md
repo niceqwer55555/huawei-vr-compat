@@ -153,7 +153,7 @@ sh tools/grant-vr-perms.sh <设备地址>
 | 眼镜插上无外接屏 | 7T 的 DP Alt Mode 未协商成 4-lane，或用了不支持 Alt Mode 的线 | 确认 `hotdogb-boot` DP 补丁已刷；换支持 DP 的 Type-C 线；`dumpsys display` 看有无 `HUAWEIAV03` |
 | `/dev/hwvr1` 建不出 | 7T KernelSU 的 `service.sh` 未跑，或 hidraw 路径不同 | 确认 KSU 模块在 late_start 拉起；`find_control_iface` 用协议探测而非写死设备名，应能自适应 |
 | 平台类 ClassNotFound 刷屏 | `shared/java` 的 40 个类未注入 | Android 11 上需 LSPosed 或 bundled dex 才生效；`lsposed/hvr-display-routing` 需启用 |
-| 投屏只有一只眼 | 若走 sample-app，`MediaProjection` 多 VirtualDisplay 在 Android 13+ 才有问题，11 上两路 SurfaceView 可用 | 用工程自带 `HvrMirrorService` 即可 |
+| 投屏只有一只眼 / 左右眼不一致 | 旧两路 SurfaceView + 多 VirtualDisplay：Android 13+ 只最后一块出图；旧写法在同一帧内容上也难严格一致 | 工程自带 `HvrMirrorService` 已改单路 GL 双画（`HvrMirrorGlView`），左右眼同一帧；换芯后生效，见 `CAST_NOROOT.md` |
 | 主界面点「开启 VR 之旅」无反应 | `vr_system` 门禁：眼镜不在位或 `com.huawei.vrservice` 没注册 binder | 按 `PATCH_AUDIT.md` 第 18/20 节查第七个包是否真正起来 |
 
 ---

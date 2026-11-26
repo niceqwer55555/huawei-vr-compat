@@ -25,14 +25,19 @@
       -> HvrMirrorEntry.start(Activity)
            -> HvrMirrorActivity        （系统录屏授权，透明主题）
                 -> HvrMirrorService     （foregroundServiceType=mediaProjection）
-                     -> MediaProjection.createVirtualDisplay(AUTO_MIRROR, 眼镜 Surface)
-                     -> 眼镜 display 上左右各一个 SurfaceView
+                     -> MediaProjection.createVirtualDisplay(AUTO_MIRROR, 一路 SurfaceTexture)
+                     -> HvrMirrorGlView 在眼镜 display 上把同一帧左右各画一次（横屏 SBS）
 
-> **Android 13+ 注意**：同一个 `MediaProjection` 创建多个 `VirtualDisplay`
-> 时，系统只让最后创建的那块出图（Android 14 还限制 token 复用）。这里的
-> 两路 `SurfaceView` 写法在 13+ 上可能只有一只眼有画面。通用修复是
-> **只建一个 VirtualDisplay → SurfaceTexture → GL 左右眼各画一次**，
-> 可参考 `sample-app/.../cast/MirrorGlView.java`。
+> **横屏 SBS、左右眼一样（2026-11-26 起）**：眼镜面板 3200x1600（2:1 横屏），
+> SBS 左右并排 → 每眼 1600x1600（1:1 正方形）。`HvrMirrorService` 现在**只建一个**
+> VirtualDisplay → SurfaceTexture → `HvrMirrorGlView` 在左右两个 viewport 各画同一帧，
+> 左右眼内容严格一致——不是把一张画面从中间劈成左右各半，也不是带视差的真 3D。
+>
+> **Android 13+ 注意**：同一个 `MediaProjection` 创建多个 `VirtualDisplay` 时，
+> 系统只让最后创建的那块出图（Android 14 还限制 token 复用）。旧的两路
+> `SurfaceView` 写法在 13+ 上只有一只眼有画面、双目内容不一致（即 `PATCH_AUDIT.md`
+> 记的遗留问题），已由上面的单路 GL 双画修复。实现见
+> `shared/java/com/huawei/vrvirtualscreen/mirror/HvrMirrorGlView.java`。
 
 用的全是公开 API：
 
@@ -42,7 +47,7 @@
 | 录屏授权 | `MediaProjectionManager.createScreenCaptureIntent()` |
 | 前台服务 | `startForeground(..., FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)` |
 | 显示到眼镜 | 眼镜 display context 上的 `TYPE_APPLICATION_OVERLAY`（失败时回退 `Presentation`） |
-| 镜像 | `MediaProjection.createVirtualDisplay(..., VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, ...)` |
+| 镜像 | `MediaProjection.createVirtualDisplay(..., VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surfaceTexture)`（单路）+ GL 左右各画一次 |
 
 新增清单项（`patches/patch_mirror_entry.py`）：
 

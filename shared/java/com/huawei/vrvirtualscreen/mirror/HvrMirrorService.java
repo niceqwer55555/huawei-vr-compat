@@ -22,38 +22,28 @@ import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.Surface;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
+import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.widget.FrameLayout;
-import android.widget.LinearLayout;
 import android.widget.Toast;
 
-import java.util.ArrayList;
-import java.util.List;
-
 /**
- * 把手机默认屏镜像到眼镜副屏（免 root）。
+ * 把手机默认屏镜像到眼镜副屏（免 root），横屏 SBS、左右眼显示同一帧。
  *
- * 公开 API 链路：
+ * <p>链路（公开 API）：</p>
+ * <pre>
+ *   MediaProjectionManager.createScreenCaptureIntent()  （Activity 里授权）
+ *     -> MediaProjection.createVirtualDisplay(AUTO_MIRROR, 一路 SurfaceTexture)
+ *     -> HvrMirrorGlView 在眼镜 display 上把这一帧左右各画一次
+ * </pre>
  *
- *   MediaProjectionManager.createScreenCaptureIntent()  （用户在 Activity 里授权）
- *     -> MediaProjection.createVirtualDisplay(AUTO_MIRROR, 眼睛那一路 Surface)
- *     -> SurfaceView 在眼镜 display 上显示
+ * <p>华为 VR Glass 物理面板 3200x1600（2:1 横屏），SBS 左右并排 → 每眼 1600x1600
+ * 正方形。2026-11-26 起改用<b>单路 VirtualDisplay + GL 双画</b>：左右眼采样同一帧、
+ * 内容严格一致，正是「横屏 SBS、左右眼显示一样」。旧实现是两个 SurfaceView +
+ * 两个 VirtualDisplay，Android 13+ 只有最后一块出图，导致双目内容不一致/单眼黑屏
+ * （PATCH_AUDIT 遗留问题、CAST_NOROOT.md §Android 13+ 注意）。</p>
  *
- * 华为 VR Glass 的面板是一块 3200x1600 的横屏（2:1），左右两半分别是左右眼，
- * 即每眼 1600x1600 的 1:1 正方形面板。承载 SBS 的 overlay 副屏必须设成横屏
- * 3200x1600，{@code eyeWidth = panelWidth / 2, eyeHeight = panelHeight} 才会得到
- * 每眼 1600x1600、合成到物理面板时 1:1 不变形（旧口径把副屏设成 1920x1080，
- * 每眼 960x1080 会被横向拉伸，2026-11-26 修正）。
- *
- * 这里按「左右各一份手机画面」摆放，各自建一条 MediaProjection 虚拟屏，保持手机屏幕
- * 的比例居中（letterbox），避免把竖屏画面横向拉满——这是每眼正方形格子里放
- * 16:9 画面的正确做法，不是把格子本身改成 16:9。
- *
- * 只依赖 `SYSTEM_ALERT_WINDOW`（安装脚本的 appops，或设置里手动给「显示在其他
- * 应用上层」）；不需要 root / LSPosed，也不需要华为 VR 系统服务。
+ * <p>只依赖 SYSTEM_ALERT_WINDOW；不需要 root / LSPosed / 华为 VR 系统服务。</p>
  */
 public final class HvrMirrorService extends Service {
 
@@ -65,9 +55,10 @@ public final class HvrMirrorService extends Service {
     private static final int NOTIFICATION_ID = 0x48565201;
 
     private MediaProjection projection;
-    private final List<VirtualDisplay> virtualDisplays = new ArrayList<>();
+    private VirtualDisplay virtualDisplay;
+    private int castDensityDpi = DisplayMetrics.DENSITY_DEFAULT;
     private WindowManager windowManager;
-    private ViewGroup overlay;
+    private View overlay;
     private Presentation presentation;
 
     @Override
@@ -131,7 +122,7 @@ public final class HvrMirrorService extends Service {
         }
         builder.setSmallIcon(android.R.drawable.ic_menu_view)
                 .setContentTitle("VR 投屏")
-                .setContentText("正在把手机屏幕投射到眼镜")
+                .setContentText("正在把手机屏幕投射到眼镜（横屏 SBS，左右眼一致）")
                 .setOngoing(true);
         Notification notification = builder.build();
         if (Build.VERSION.SDK_INT >= 29) {
@@ -158,8 +149,6 @@ public final class HvrMirrorService extends Service {
         display.getRealMetrics(panelMetrics);
         final int panelWidth = Math.max(1, panelMetrics.widthPixels);
         final int panelHeight = Math.max(1, panelMetrics.heightPixels);
-        final int densityDpi = panelMetrics.densityDpi > 0
-                ? panelMetrics.densityDpi : DisplayMetrics.DENSITY_DEFAULT;
 
         DisplayMetrics phoneMetrics = new DisplayMetrics();
         try {
@@ -180,40 +169,25 @@ public final class HvrMirrorService extends Service {
             phoneHeight = panelHeight;
         }
 
+        // 每眼面板格子 = 面板宽/2 x 面板高（物理 3200x1600 → 1600x1600 正方形）。
+        // 虚拟屏按手机比例缩放后居中进这个格子，左右眼用同一份内容。
         int eyeWidth = Math.max(1, panelWidth / 2);
-        int eyeHeight = panelHeight;
         float scale = Math.min((float) eyeWidth / phoneWidth,
-                (float) eyeHeight / phoneHeight);
+                (float) panelHeight / phoneHeight);
         final int viewWidth = Math.max(1, Math.round(phoneWidth * scale));
         final int viewHeight = Math.max(1, Math.round(phoneHeight * scale));
+        castDensityDpi = phoneMetrics.densityDpi > 0
+                ? phoneMetrics.densityDpi
+                : (panelMetrics.densityDpi > 0
+                        ? panelMetrics.densityDpi : DisplayMetrics.DENSITY_DEFAULT);
 
-        LinearLayout row = new LinearLayout(displayContext);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        for (int eye = 0; eye < 2; eye++) {
-            FrameLayout cell = new FrameLayout(displayContext);
-            LinearLayout.LayoutParams cellParams = new LinearLayout.LayoutParams(
-                    0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
-            SurfaceView view = new SurfaceView(displayContext);
-            FrameLayout.LayoutParams viewParams = new FrameLayout.LayoutParams(
-                    viewWidth, viewHeight, Gravity.CENTER);
-            cell.addView(view, viewParams);
-            row.addView(cell, cellParams);
-            view.getHolder().addCallback(new SurfaceHolder.Callback() {
-                @Override
-                public void surfaceCreated(SurfaceHolder holder) {
-                    createMirror(holder.getSurface(), viewWidth, viewHeight, densityDpi);
-                }
-
-                @Override
-                public void surfaceChanged(SurfaceHolder holder, int format,
-                                           int width, int height) {
-                }
-
-                @Override
-                public void surfaceDestroyed(SurfaceHolder holder) {
-                }
-            });
-        }
+        HvrMirrorGlView view = new HvrMirrorGlView(displayContext);
+        view.mirror(viewWidth, viewHeight, new HvrMirrorGlView.InputSurfaceListener() {
+            @Override
+            public void onInputSurface(Surface surface, int width, int height) {
+                attachProjection(surface, width, height);
+            }
+        });
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -226,23 +200,24 @@ public final class HvrMirrorService extends Service {
         params.gravity = Gravity.FILL;
         try {
             windowManager = (WindowManager) displayContext.getSystemService(WINDOW_SERVICE);
-            windowManager.addView(row, params);
-            overlay = row;
+            windowManager.addView(view, params);
+            overlay = view;
             Log.i(TAG, "mirror overlay shown on display " + display.getDisplayId()
                     + " (" + display.getName() + ") " + panelWidth + "x" + panelHeight
-                    + ", eye " + viewWidth + "x" + viewHeight);
-            Toast.makeText(this, "投屏中：" + display.getName(),
+                    + ", eye " + (panelWidth / 2) + "x" + panelHeight
+                    + ", SBS 左右眼各一份相同画面");
+            Toast.makeText(this, "投屏中（横屏 SBS）：" + display.getName(),
                     Toast.LENGTH_SHORT).show();
         } catch (Throwable error) {
             Log.w(TAG, "overlay rejected (" + error + "), trying a Presentation");
             Toast.makeText(this, "悬浮窗被拒绝，尝试 Presentation",
                     Toast.LENGTH_SHORT).show();
             overlay = null;
-            showPresentation(displayContext, display, row);
+            showPresentation(displayContext, display, view);
         }
     }
 
-    private void showPresentation(Context displayContext, Display display, ViewGroup content) {
+    private void showPresentation(Context displayContext, Display display, View content) {
         try {
             Presentation window = new Presentation(displayContext, display);
             window.setContentView(content);
@@ -263,32 +238,50 @@ public final class HvrMirrorService extends Service {
         }
     }
 
-    private void createMirror(Surface surface, int width, int height, int dpi) {
+    /** GL 的 SurfaceTexture 就绪后回调；只建一路 VirtualDisplay。 */
+    private void attachProjection(Surface surface, int width, int height) {
         if (projection == null || surface == null || !surface.isValid()) {
             return;
         }
+        releaseVirtualDisplay();
         try {
-            VirtualDisplay display = projection.createVirtualDisplay(
-                    "HW-VR-Cast-" + virtualDisplays.size(), width, height, dpi,
+            VirtualDisplay created = projection.createVirtualDisplay(
+                    "HW-VR-Cast", width, height, castDensityDpi,
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     surface, null, null);
-            virtualDisplays.add(display);
-            Log.i(TAG, "mirror virtual display " + width + "x" + height + " created");
+            if (created == null) {
+                Log.w(TAG, "createVirtualDisplay returned null");
+                Toast.makeText(this, "眼镜画面创建失败", Toast.LENGTH_LONG).show();
+                stopSelf();
+                return;
+            }
+            virtualDisplay = created;
+            Log.i(TAG, "mirror virtual display " + width + "x" + height
+                    + " created (single source, GL draws both eyes)");
         } catch (Throwable error) {
             Log.w(TAG, "createVirtualDisplay failed: " + error);
+            Toast.makeText(this, "眼镜画面创建失败：" + error, Toast.LENGTH_LONG).show();
+            stopSelf();
         }
+    }
+
+    private void releaseVirtualDisplay() {
+        if (virtualDisplay == null) {
+            return;
+        }
+        try {
+            virtualDisplay.release();
+        } catch (Throwable error) {
+            Log.w(TAG, "release virtualDisplay failed: " + error);
+        }
+        virtualDisplay = null;
     }
 
     @Override
     public void onDestroy() {
-        for (VirtualDisplay display : virtualDisplays) {
-            try {
-                display.release();
-            } catch (Throwable error) {
-                Log.w(TAG, "release virtual display failed: " + error);
-            }
-        }
-        virtualDisplays.clear();
+        // 先断开捕获，再销毁承载 Surface 的窗口。
+        releaseVirtualDisplay();
+
         if (presentation != null) {
             try {
                 presentation.dismiss();

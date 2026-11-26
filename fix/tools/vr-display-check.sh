@@ -30,7 +30,7 @@ say() { printf '\n=== %s ===\n' "$1"; }
 
 say "A. Display 全景（设备实际有哪些屏）"
 sh_shell 'dumpsys display | grep -o "DisplayDeviceInfo{[^,]*, [0-9]* x [0-9]*[^,]*" | head -12'
-echo "    （HW-VR-Cast-* = 投屏双目镜像屏，尺寸由 overlay 副屏推算，见 C）"
+echo "    （HW-VR-Cast = 投屏单路镜像屏；HvrMirrorGlView 把它左右各画一次→双目一致，见 C）"
 echo "--- HUAWEI VR Display 计数（>0 才算三段式第②环通）---"
 # 只数 DisplayDeviceInfo 行：dumpsys 里还会重复出现 mUniqueId / mBaseDisplayInfo
 # 等 4~5 处同名字符串，用 grep -c "HUAWEI VR Display" 会把 1 块数成 5 块。
@@ -47,8 +47,8 @@ say "C. overlay_display_devices 与 SBS 每眼尺寸（物理面板 3200x1600 �
 OVR=$(sh_shell 'settings get global overlay_display_devices')
 echo "    overlay_display_devices = ${OVR:-（未设置）}"
 echo "    眼镜物理面板 = 3200x1600（2:1 横屏），SBS 左右并排 → 每眼 1600x1600（1:1 正方形）。"
-echo "    HvrMirrorService: eyeWidth = panelWidth/2, eyeHeight = panelHeight；"
-echo "      手机画面按 min(eyeW/phoneW, eyeH/phoneH) 缩放后居中放进每眼（letterbox）。"
+echo "    HvrMirrorService 单路 GL 双画：VirtualDisplay 按手机比例缩放，"
+echo "      HvrMirrorGlView 把同一帧在左右两个 viewport 各画一次 → 左右眼内容一致。"
 echo "    2026-11-26 起按可视面积最大选面板（dual 档选 3200x1600 大屏，不再退回第一块 100x100）。"
 printf '%s' "${OVR:-0x0}" | tr ';' '\n' | awk -F'[/x]' '
     $1+0>0 && $2+0>0 { a=$1*$2; if (a>best) { best=a; bw=$1+0; bh=$2+0 } }

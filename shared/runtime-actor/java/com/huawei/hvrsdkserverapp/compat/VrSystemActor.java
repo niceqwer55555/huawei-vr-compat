@@ -236,15 +236,21 @@ public final class VrSystemActor implements DisplayManager.DisplayListener {
 
     /**
      * EMUI put the device into landscape for the whole VR session. Without it the
-     * VR activity is a 1588x1080 landscape window inside a 1080x2640 portrait
-     * display, and the glasses only receive that portrait screen scaled into the
-     * 3200x1600 panel:
+     * VR activity stays a portrait window and the glasses receive a portrait
+     * screen scaled/offset into the 3200x1600 panel (PATCH_AUDIT 11.4: layer
+     * bounds={139,0,1600,3200}, i.e. 1600x3200 + 139px offset) — the user sees
+     * a half-frame / distorted image.
      *
-     *   phone:  cur=1080x2640  layer bounds={0,1146,1588,1080}
-     *   glasses mirror: scale 0.6061, tx=1272, ty=694.5      (small, offset band)
+     * Two things together make the phone's logical display 3200x1600, matching
+     * the panel 1:1 (scale = 1, no offset), which is the EMUI "VR mode" geometry:
      *
-     * Locking to landscape makes the display 2640x1080 and the same mirror scale
-     * becomes 1.2121 (2640 * 1.2121 = 3200), i.e. full width of the panel.
+     *   1. this method locks ROTATION_90 (user_rotation=1, accelerometer off);
+     *   2. the KSU module's service.sh sets `wm size 1600x3200` (see
+     *      ksu/hwvr_compat/service.sh set_size). 1600x3200 rotated 90° = 3200x1600.
+     *
+     * Do not read the old 2640x1080 / 1.2121 numbers from earlier field notes as
+     * the target: those were from a 1080x2640 physical phone with no size override.
+     * The current adaptation overrides the logical size, so the target is 1:1.
      */
     private void lockLandscape() {
         try {

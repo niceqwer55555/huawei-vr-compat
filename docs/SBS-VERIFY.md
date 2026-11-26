@@ -18,7 +18,7 @@
 | 送到眼镜 | ① Presentation + SurfaceView → ② 3200×1600 虚拟屏 → ③ `setLaunchDisplayId` 路由应用 | 一条 VirtualDisplay → 左右各一个 SurfaceView |
 | 依赖 | panel-bootstrap 预建屏 + 面积选大屏 + 强制横屏 | 仅 `SYSTEM_ALERT_WINDOW` appop；用户点一次录屏授权 |
 | 相关修复 | `SBS-PANEL-FIX.md`（本次面板按面积）+ `SBS-PANEL-FIX-BUILD.md`（换芯） | `CAST_NOROOT.md` |
-| 现状 | ⚠️ 三段式已通到"应用落在非默认屏"，但**官方前缓冲直出仍缺**（§5.7），画面几何待真机确认 | ✅ 公开 API 可用；Android 13+ 双目只有一只眼的坑见 `CAST_NOROOT.md` |
+| 现状 | ⚠️ 三段式已通到"应用落在非默认屏"，但**官方前缓冲直出仍缺**（§5.7），画面几何待真机确认 | ✅ 公开 API 可用；2026-11-26 起单路 GL 双画，左右眼一致（旧 Android 13+ 单眼坑已修，见 `CAST_NOROOT.md`） |
 
 > 你前面问的"投屏从中间被拆成两份"是 **SBS 帧的结构**（左右眼并排），
 > 两条路线送到眼镜的那一刻都要满足这个结构，区别只在于画面从哪来。
@@ -52,6 +52,8 @@
 sh tools/apply-sbs-panel-fix.sh <serial> com.huawei.vrservice
 sh tools/apply-sbs-panel-fix.sh <serial> com.huawei.vrvirtualscreen
 #    （若 vrservice 之外的包也含 VrPlatformCompat，按脚本提示逐个处理）
+#    注：com.huawei.vrvirtualscreen 换芯后连带拿到 HvrMirrorGlView —— 投屏改为
+#        单路 GL 双画、横屏 SBS、左右眼同一帧（解决双目内容不一致/单眼黑屏）。
 
 # 2) 切 dual 档：小屏满足在位判据，大屏承载 SBS
 sh fix/tools/vr-overlay-mode.sh <serial> dual
@@ -120,9 +122,10 @@ adb -s <serial> shell dumpsys SurfaceFlinger | grep -A3 'HUAWEIAV03\|HUAWEI VR D
 | `panel presentation shown on display` 挂到小屏 id | 面板选择补丁没进这份 dex | `SBS-PANEL-FIX.md` §2，重编 dex |
 | G 段 `HvrVrPanel = 0`，① 从未挂 | panel-bootstrap 没预建屏 | `fix/README.md` §11.13 |
 | 应用仍落在 `displayId=0` 主屏 | `setLaunchDisplayId` 路由失败 / 跨进程被拦 | `vr-display-check.sh` D 段、`fix/README.md` §11.12 |
-| 几何是竖屏 1600×3200 + 偏移 | 强制横屏没写生效 | `PATCH_AUDIT.md` §11.5，查 `user_rotation` |
+| 几何是竖屏 1600×3200 + 偏移 | 强制横屏没写生效 / `wm size` 没覆盖 | `vr-desktop-view-check.sh` A/B 段、`PATCH_AUDIT.md` §11.5 |
+| **VR 桌面**能进但画面变形/半幅/拉伸（本脚本查"应用没显示"，那个查"桌面自己画面不对"） | 面板 mode 非 3200×1600 / 方向或逻辑尺寸没锁 | `fix/tools/vr-desktop-view-check.sh`，专题见 `docs/VR-DESKTOP-VIEW-FIX.md` |
 | 眼镜有画面但两眼内容叠在一起 | overlay 用了 `panel` 档（主屏递归叠影） | `vr-overlay-mode.sh small` 或 `dual` |
-| Android 13+ 镜像投屏只有一只眼 | 一个 MediaProjection 建多 VirtualDisplay 受限 | `CAST_NOROOT.md` 末尾，改 GL 单 Display 双画 |
+| 镜像投屏只有一只眼 / 左右眼内容不一致 | 一个 MediaProjection 建多 VirtualDisplay 受限（旧两路写法） | 已改单路 GL 双画：`HvrMirrorGlView`，经 `apply-sbs-panel-fix.sh` 换芯；见 `CAST_NOROOT.md` |
 | 眼镜黑屏且 `ioGetVendorInfo failed` | `/dev/hwvr1` 指错 hidraw 口 | `hwvr1-check.sh`、`2026-11-08...` §7 |
 | 面板亮但无画面、Unity 自杀 | SurfaceView 缓冲被 light-on 打废 | `2026-11-08...` 层 1，force-stop 重启 launcherx |
 

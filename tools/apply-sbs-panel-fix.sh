@@ -3,8 +3,10 @@
 #
 # 背景（docs/SBS-PANEL-FIX.md）：2026-11-26 修复了 shared/java 里
 #   VrPlatformCompat.externalDisplay() / HvrPanelFinder 的面板选择逻辑（改为按可视
-#   面积取最大），解决 dual 档下 SBS 面板被压成 100x100 空壳。该改动已编译成
-#   build/compat-dex/compat-sbs-panel-fix.dex。本脚本把它换进 APK 的 compat dex。
+#   面积取最大），解决 dual 档下 SBS 面板被压成 100x100 空壳；同日把 HvrMirrorService
+#   改成单路 GL 双画（HvrMirrorGlView），横屏 SBS、左右眼显示同一帧，解决双目内容
+#   不一致/单眼黑屏。该改动已编译成 build/compat-dex/compat-sbs-panel-fix.dex，
+#   本脚本把它换进 APK 的 compat dex。
 #
 # 为什么是「换 dex」而不是「重编全包」：仓库 7 个 APK 各自注入了同一份 compat dex
 #   （历史固定叫 classes4.dex），36 个 manifest/smali 补丁已固化在设备上的 APK 里。
@@ -80,9 +82,10 @@ d = open(sys.argv[1], 'rb').read()
 assert d[:4] == b'dex\n', "不是 dex"
 for k in (b'Lcom/huawei/vrframework/compat/VrPlatformCompat;',
           b'Lcom/huawei/vrvirtualscreen/mirror/HvrPanelFinder;',
+          b'Lcom/huawei/vrvirtualscreen/mirror/HvrMirrorGlView;',
           b'largestDisplay'):
     assert k in d, "新 dex 缺少 %s" % k.decode()
-print("  新 dex %d B，类与 largestDisplay 方法齐全" % len(d))
+print("  新 dex %d B：面板修复 + 单路 GL 双画类/方法齐全" % len(d))
 PY
 
 step "4/6 替换 dex（其余条目逐字节保留）"

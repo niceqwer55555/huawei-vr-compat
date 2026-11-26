@@ -24,7 +24,7 @@
 | 手柄 3DOF | `libctrl3dof.so`，`DOEaG` + `FF_RLS` + 磁异常判定 | `VrCtrl3Dof_*` C 接口 | **能**（算法要自己写） |
 | 6DOF | 双目鱼眼 + IMU 的 VIO/SLAM（`libVR6Dof.so` + `libarvr_slam.so`） | `GetVR6DofInterface()` | **不能凭空复刻**：需要相机标定与 SLAM；可用公开 `TYPE_POSE_6DOF`（设备支持时）或 ARCore |
 | 原版投屏 | `createVrDisplay` 建虚拟屏 → `SurfaceTexture` 采集 → OpenXR 立体提交 | `libxr_renderer.so` | **只能等价替代**：副屏 + MediaProjection |
-| 免 root 投屏 | 副屏 + `MediaProjection` + 单路 `SurfaceTexture` 双目采样 | `MirrorGlView` | **能**；`HvrMirrorService` 仍是两路 SurfaceView，Android 13+ 需按此改造 |
+| 免 root 投屏 | 副屏 + `MediaProjection` + 单路 `SurfaceTexture` 双目采样 | `MirrorGlView` | **能**；2026-11-26 起 `HvrMirrorService` 已换用 `HvrMirrorGlView` 单路双画，左右眼一致 |
 
 一句话：**姿态的 3DOF 部分是可移植的算法 + 协议；原厂 6DOF 是相机 SLAM，不是 IMU 技巧，通用设备只能用公开 `TYPE_POSE_6DOF`（有则用）或 ARCore/自建 VIO 替代；投屏原版是系统级合成，通用替代是平面镜像或自建双目渲染。**
 
@@ -684,24 +684,27 @@ Vulkan 的 `[0,1]`）与 `UpdateMatrixByNearZAndFarZ` 的具体修复项，没�
 
 ### 6.4 免 root 投屏 `[实测 + Android 13 修正]`
 
-下面是**修正后的目标管线**（示例 App 的 `MirrorGlView` 已按此实现）；
-仓库里的 `HvrMirrorService` 目前仍是两路 `SurfaceView`，在 Android 13+ 上需要
-按这一段改造：
+下面是**已落地的管线**（2026-11-26 起 `HvrMirrorService` 已从旧的两路
+`SurfaceView` 改造为单路 GL 双画，`HvrMirrorGlView` 是它的自包含版本）：
 
 ```
 Vr2dStartUpActivity
   → HvrMirrorEntry.start()
     → HvrMirrorActivity          系统录屏授权（透明主题）
       → HvrMirrorService         前台服务
-        → MediaProjection.createVirtualDisplay(AUTO_MIRROR, SurfaceTexture)
-        → 一个 GLSurfaceView 里左右眼各采样同一帧
+        → MediaProjection.createVirtualDisplay(AUTO_MIRROR, SurfaceTexture)  ← 只建一个
+        → HvrMirrorGlView 里左右眼各采样同一帧（横屏 SBS，左右一致）
 ```
 
-**不要建两个 VirtualDisplay**：Android 13 起，同一个 `MediaProjection`
+**不建两个 VirtualDisplay**：Android 13 起，同一个 `MediaProjection`
 创建多个 `VirtualDisplay` 时只有最后创建的那块能出图；Android 14 进一步限制
-token 复用。正确做法是**只建一个** VirtualDisplay 到 `SurfaceTexture`，
-再把这一张外部纹理在左右两个 viewport 各画一次（示例见
-`sample-app/.../cast/MirrorGlView.java`）。
+token 复用。`HvrMirrorService` 现在**只建一个** VirtualDisplay 到 `SurfaceTexture`，
+再把这一张外部纹理在左右两个 viewport 各画一次，因此左右眼内容严格一致。
+实现见 `shared/java/com/huawei/vrvirtualscreen/mirror/HvrMirrorGlView.java`
+（示例原型 `sample-app/.../cast/MirrorGlView.java`）。
+
+**每眼规格**：面板 3200x1600（2:1 横屏）→ SBS 每眼 1600x1600（1:1 正方形）；
+虚拟屏按手机比例缩放后居中进每眼格子，左右两眼用同一帧、同一缩放。
 
 | 能力 | 公开 API |
 | --- | --- |
