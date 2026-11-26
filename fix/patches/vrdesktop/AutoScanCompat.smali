@@ -178,6 +178,24 @@
 
     if-eqz v1, :ret
 
+    # 2026-11-26: only accept real VR controllers (CF20). Without this filter
+    # every nearby BLE device (Mi Watch / scale / speaker) gets persisted and
+    # vrhandle retries connecting forever -> logcat flood + CPU waste.
+    invoke-virtual {v1}, Ljava/lang/String;->toUpperCase()Ljava/lang/String;
+
+    move-result-object v2
+
+    const-string v3, "CF20"
+
+    invoke-virtual {v2, v3}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v2
+
+    if-eqz v2, :accept_device
+
+    return-void
+
+    :accept_device
     invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
 
     move-result-wide v2
