@@ -1,0 +1,8 @@
+# ALVR 原版(华为专版 20.14.1)只在 android.os.Build.MANUFACTURER 为
+# HUAWEI/HONOR 时走 HuaweiVrGlass 分支：直接用 libxr_loader.so、
+# 不调 initialize_android_loader()、并启用华为专有 OpenXR 扩展。
+# 一加7T 的 OnePlus 会让 native 走通用分支，在
+# entry_point_with_window 的 initialize_android_loader().unwrap()
+# 抛 ERROR_HANDLE_INVALID 并 panic -> 眼镜里黑屏。
+# 本文件由 Magisk 在 zygote 启动前应用，Build 类初始化即可读到 HUAWEI。
+ro.product.manufacturer=HUAWEI

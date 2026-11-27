@@ -51,9 +51,14 @@ hdmi_ready() {
   dumpsys display 2>/dev/null | grep -q 'DisplayDeviceInfo{"HDMI'
 }
 
-# VR 3D 桌面是否已在头显屏(MainActivity 作为某 display 的 resumed)
+# VR 3D 桌面是否还活着。
+# 2026-11-27 修正：原先判据是「MainActivity 处于 resumed」，但进桌面后
+# 自动打开的 ALVR 会把 MainActivity 压到后台 —— 于是守护每 70s 误判为
+# 「桌面掉了」，执行 start_vr_desktop.sh 里的 am force-stop 整条 VR 链，
+# 把刚启动的 ALVR 一起杀掉。表现就是 ALVR 黑屏且永远连不上服务端。
+# 现在只看桌面进程是否还在；只要进程活着就不再重启整条链。
 desktop_running() {
-  dumpsys activity activities 2>/dev/null | grep -qE 'mResumedActivity.*com\.huawei\.vrlauncherx/\.MainActivity'
+  pidof com.huawei.vrlauncherx >/dev/null 2>&1
 }
 
 log "=== autostart daemon up (cooldown=${COOLDOWN}s) ==="

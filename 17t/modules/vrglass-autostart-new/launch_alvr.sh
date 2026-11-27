@@ -42,17 +42,48 @@ else
   log "WARN: patch dex $PATCH missing"
 fi
 
-# 1.5) 修 native OpenXR loader：ALVR native 要 dlopen("libopenxr_loader.so")，
-#      但官方 APK 里只有 libxr_loader.so，名字对不上 -> panic。
-#      复制一份真实文件并改名（软链不行：Android classloader 不认）。
+# 1.5) OpenXR loader 必须用 74KB 的 Khronos loader 前端(md5 f864cac5)，
+#      它会再 dlopen APK 自带的 965KB libxr_loader.so (华为 runtime)。
+#      2026-11-27 教训：把 965KB 那个直接改名当 loader 会跳过扩展枚举，
+#      在 entry_point_with_window 的 initialize_android_loader().unwrap()
+#      直接 ERROR_HANDLE_INVALID panic；74K+965K 组合才能正常枚举扩展。
 ALVR_LIBDIR=$(pm path "$ALVR" 2>/dev/null | sed 's/package://' | sed 's|base.apk||')
 ALVR_LIBDIR="${ALVR_LIBDIR}lib/arm"
-if [ -f "$ALVR_LIBDIR/libxr_loader.so" ] && [ ! -f "$ALVR_LIBDIR/libopenxr_loader.so" ]; then
-  cp "$ALVR_LIBDIR/libxr_loader.so" "$ALVR_LIBDIR/libopenxr_loader.so" 2>/dev/null
+if [ -f "$MODDIR/libopenxr_loader.74k.so" ]; then
+  cp -f "$MODDIR/libopenxr_loader.74k.so" "$ALVR_LIBDIR/libopenxr_loader.so" 2>/dev/null
   chown system:system "$ALVR_LIBDIR/libopenxr_loader.so" 2>/dev/null
   chmod 755 "$ALVR_LIBDIR/libopenxr_loader.so" 2>/dev/null
-  log "created libopenxr_loader.so"
+  log "installed 74K OpenXR loader (f864cac5)"
 fi
+
+# 1.6) hvrframework.dex: 原版 ALVR 没有 com.huawei.android.permission.VR
+#      (signature)，VrParamsRequester.bindVrService/bindVrLauncherx/
+#      bindRuntimeService 三个方法绑定华为服务时抛 SecurityException；
+#      该异常在 native 渲染线程冒泡成 JavaException，导致
+#      app_dirs2 config_path() panic。三个方法对串流非必需，补丁 dex
+#      直接 return-void。
+HVR=$SDK/hvrframework.dex
+if [ -f "$MODDIR/alvr_hvr.bindfix.dex" ]; then
+  if ! grep -aq '2026-11-27' "$HVR" 2>/dev/null; then
+    chattr -i "$HVR" 2>/dev/null
+    cp -f "$MODDIR/alvr_hvr.bindfix.dex" "$HVR"
+    chown u0_a225:u0_a225 "$HVR" 2>/dev/null
+    chmod 600 "$HVR" 2>/dev/null
+    rm -rf "$SDK/oat" 2>/dev/null
+    log "patched hvrframework.dex (skip 3 bindService calls)"
+  fi
+fi
+
+# 1.7) 危险权限：zygote 重启/清后台后可能被撤销，幂等回补。
+for p in android.permission.RECORD_AUDIO android.permission.READ_EXTERNAL_STORAGE \
+         android.permission.WRITE_EXTERNAL_STORAGE android.permission.ACCESS_MEDIA_LOCATION; do
+  pm grant "$ALVR" "$p" >/dev/null 2>&1
+done
+
+# 1.8) 兜底重置 manufacturer。真正的持久化在本模块 system.prop
+#      (Magisk 在 zygote 启动前应用，使 Build.MANUFACTURER=HUAWEI，
+#       ALVR native 才会走 HuaweiVrGlass 分支而非通用分支)。
+resetprop ro.product.manufacturer HUAWEI 2>/dev/null
 
 # 2) 等桌面在头显屏稳定 (MainActivity resumed)
 i=0
