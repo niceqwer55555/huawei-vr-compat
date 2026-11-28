@@ -17,6 +17,7 @@ DEX=$SDK/classes.dex
 MODDIR=${0%/*}
 PATCH=$MODDIR/alvr_sdk.fullcompat.dex           # 补好类的 dex (随模块部署,重启不丢)
 MARK=/data/local/tmp/.alvr_patched              # 补丁版本标记
+MARK2=/data/local/tmp/.alvr_patched_qcom        # 高通解码器版标记 (2026-11-28)
 LOG=/data/local/tmp/alvr_launch.log
 DISPLAY=1
 
@@ -28,6 +29,10 @@ if [ -f "$PATCH" ]; then
   [ -f "$MARK" ] || need=1
   # 若 dex 被还原(不含 compat)则重新打补丁
   if ! grep -aq "VrPlatformCompat" "$DEX" 2>/dev/null; then need=1; fi
+  # 2026-11-28 高通解码器版升级：设备端仍是 hisi OMX 名或没有 qcom 标记时必须刷新。
+  # 只查 VrPlatformCompat 会把旧 hisi dex 当成已补丁而跳过，导致 qcom dex 永远不落地。
+  [ -f "$MARK2" ] || need=1
+  if grep -aq "OMX.hisi.video.decoder" "$DEX" 2>/dev/null; then need=1; fi
   if [ "$need" = "1" ]; then
     chattr -i "$DEX" 2>/dev/null
     cp -f "$PATCH" "$DEX"
@@ -36,7 +41,8 @@ if [ -f "$PATCH" ]; then
     rm -rf "$SDK/oat" 2>/dev/null
     chattr +i "$DEX" 2>/dev/null
     echo ok > "$MARK"
-    log "patched ALVR classes.dex + chattr lock"
+    echo qcom > "$MARK2"
+    log "patched ALVR classes.dex (qcom decoder) + chattr lock"
   fi
 else
   log "WARN: patch dex $PATCH missing"

@@ -45,7 +45,7 @@ Presentation 到副屏
 | VR Activity / Launcher 生命周期 | 手机 2D 入口 + `com.huawei.android.vr.action.MAIN` VR Activity |
 | 眼镜显示方向 | 保留 Runtime 所需的每眼 90° 物理方向，单独修 Y 轴镜像 |
 | FOV 偏广 | 保留 Runtime 原始 95°×95°，不用通用倾斜视锥扩张 |
-| HiSilicon 解码 | 优先 `OMX.hisi.video.decoder.avc`，软件回退 |
+| HiSilicon 解码 | 上游优先 `OMX.hisi.video.decoder.avc`；**高通移植版改为 `OMX.qcom.video.decoder.avc`**（见 `ALVR-QCOM-DECODER.md`） |
 | 解码时间戳错位 | 从 Surface 时间戳反推 ALVR PTS，修复重投影方向/裁剪/抖动 |
 | 6DoF 手柄 | 左右手独立 Pose Action，按键/扳机/握把/振动 |
 | 摇杆范围 | 华为 0～1、中心 0.5 → -1～1，Y 修正 + 0.12 圆形死区 |
@@ -105,7 +105,7 @@ Presentation 到副屏
 | 编解码单眼分辨率 | Runtime 推荐 `1.0×`（当前设备对齐后 1536×1536） |
 | SteamVR 模拟头显单眼分辨率 | 同上 |
 | 首选刷新率 | 72 Hz（Runtime 实际 70 Hz，自动取最近值） |
-| 编解码器 | H.264，优先 HiSilicon 硬解 |
+| 编解码器 | H.264，高通设备优先 `OMX.qcom.video.decoder.avc` 硬解（麒麟设备为 `OMX.hisi.*`） |
 | 码率 | 14 Mbps 起步 |
 | 网络协议 | TCP |
 | 客户端缓冲 | 1 帧 |
